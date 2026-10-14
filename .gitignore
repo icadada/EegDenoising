@@ -14,3 +14,6 @@ venv/
 
 # 临时文件
 *.log
+
+# 训练结果（与 code、data 同级，体积很大，不入库）
+/results/

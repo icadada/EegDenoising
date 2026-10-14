@@ -31,13 +31,14 @@ import numpy as np  # noqa: E402
 from matplotlib import font_manager  # noqa: E402
 
 from utils import (  # noqa: E402
-    loss_filename,
+    ensure_dir,
+    find_loss_path,
+    find_metric_path,
+    find_summary_path,
+    find_train_history_path,
     load_json,
     load_npy,
     load_npy_dict,
-    experiment_summary_filename,
-    metric_filename,
-    train_history_filename,
 )
 
 #: 各划分在图上显示的名字与颜色
@@ -109,36 +110,43 @@ def safe_label(text: Any, lang: str = "en") -> str:
 # --------------------------------------------------------------------------------------
 
 def read_summary(experiment_dir: str) -> Dict[str, Any]:
-    """读取实验摘要 JSON（包含噪声类型、文件前缀、指标列表等）。"""
-    path = os.path.join(experiment_dir, experiment_summary_filename())
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"找不到实验摘要：{path}")
+    """读取实验摘要 JSON（新结构在 ``训练配置/``，旧结构在实验文件夹根目录）。"""
+    path = find_summary_path(experiment_dir)
+    if not path:
+        raise FileNotFoundError(f"找不到实验摘要：{experiment_dir}/训练配置/实验摘要.json")
     return load_json(path)
 
 
 def read_train_history(experiment_dir: str, prefix: str) -> Dict[str, Any]:
     """读取 epoch 级的训练历史（loss + 每轮验证指标）。"""
-    path = os.path.join(experiment_dir, train_history_filename(prefix))
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"找不到训练历史：{path}")
+    path = find_train_history_path(experiment_dir, prefix)
+    if not path:
+        raise FileNotFoundError(f"找不到训练历史：{experiment_dir}/指标/{prefix}_训练历史.npy")
     return load_npy_dict(path)
 
 
 def read_loss(experiment_dir: str, prefix: str) -> Dict[str, Any]:
     """读取 ``<前缀>_Loss.npy``。"""
-    return load_npy_dict(os.path.join(experiment_dir, loss_filename(prefix)))
+    path = find_loss_path(experiment_dir, prefix)
+    if not path:
+        raise FileNotFoundError(f"找不到 Loss 文件：{experiment_dir}/指标/{prefix}_Loss.npy")
+    return load_npy_dict(path)
 
 
 def read_metrics(experiment_dir: str, split: str, noise_type: str, metric: str) -> np.ndarray:
     """读取某个划分某个指标的 npy（形状 = SNR 档位数）。"""
-    return np.asarray(load_npy(os.path.join(experiment_dir, metric_filename(split, noise_type, metric))),
-                      dtype=np.float64)
+    path = find_metric_path(experiment_dir, split, noise_type, metric)
+    if not path:
+        raise FileNotFoundError(f"找不到指标文件：{split}/{noise_type}/{metric}")
+    return np.asarray(load_npy(path), dtype=np.float64)
 
 
 def read_snr_levels(experiment_dir: str) -> np.ndarray:
     """读取 SNR 档位；若文件不存在则按默认 10 档返回。"""
-    path = os.path.join(experiment_dir, "SNR档位.npy")
-    if os.path.isfile(path):
+    from utils import find_in_run_dir
+
+    path = find_in_run_dir(experiment_dir, "SNR档位.npy")
+    if path:
         return np.asarray(np.load(path), dtype=np.float64)
     return np.linspace(-7.0, 2.0, num=10)
 
@@ -147,8 +155,9 @@ def read_snr_levels(experiment_dir: str) -> np.ndarray:
 # 逐个图
 # --------------------------------------------------------------------------------------
 
-def plot_loss_curve(experiment_dir: str, history: Dict[str, Any], lang: str = "en") -> str:
-    """绘制训练/验证 loss 随 epoch 的变化曲线。"""
+def plot_loss_curve(experiment_dir: str, history: Dict[str, Any], lang: str = "en",
+                    output_dir: Optional[str] = None) -> str:
+    """绘制训练/验证 loss 随 epoch 的变化曲线（默认写入实验文件夹的 ``图像/`` 子目录）。"""
     epochs = np.asarray(history.get("epochs", []), dtype=np.float64)
     train_loss = np.asarray(history.get("train_loss", []), dtype=np.float64)
     val_loss = np.asarray(history.get("val_loss", []), dtype=np.float64)
@@ -166,14 +175,16 @@ def plot_loss_curve(experiment_dir: str, history: Dict[str, Any], lang: str = "e
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    path = os.path.join(experiment_dir, "Loss曲线.png")
+    path = os.path.join(output_dir or os.path.join(experiment_dir, "图像"), "Loss曲线.png")
+    ensure_dir(os.path.dirname(path))
     fig.savefig(path, dpi=200)
     plt.close(fig)
     return path
 
 
 def plot_training_curves(
-    experiment_dir: str, history: Dict[str, Any], metric_names: List[str], lang: str = "en"
+    experiment_dir: str, history: Dict[str, Any], metric_names: List[str], lang: str = "en",
+    output_dir: Optional[str] = None,
 ) -> Optional[str]:
     """绘制每个 epoch 在验证集上的各项指标曲线（子图形式）。"""
     epochs = np.asarray(history.get("epochs", []), dtype=np.float64)
@@ -194,7 +205,8 @@ def plot_training_curves(
     axes[-1][0].set_xlabel(_text(lang, "Epoch", "训练轮次"))
     fig.suptitle(_text(lang, "Validation metrics per epoch", "验证集指标随训练轮次的变化"))
     fig.tight_layout()
-    path = os.path.join(experiment_dir, "训练过程指标曲线.png")
+    path = os.path.join(output_dir or os.path.join(experiment_dir, "图像"), "训练过程指标曲线.png")
+    ensure_dir(os.path.dirname(path))
     fig.savefig(path, dpi=200)
     plt.close(fig)
     return path
@@ -209,13 +221,14 @@ def plot_metrics_vs_snr(
     lang: str = "en",
     filename: Optional[str] = None,
     draw_reference_line: bool = False,
+    output_dir: Optional[str] = None,
 ) -> Optional[str]:
     """绘制某个指标随输入 SNR 的变化曲线（训练/验证/测试三条曲线）。"""
     fig, ax = plt.subplots(figsize=(8, 5))
     has_data = False
     for split in split_list:
-        path = os.path.join(experiment_dir, metric_filename(split, noise_type, metric))
-        if not os.path.isfile(path):
+        path = find_metric_path(experiment_dir, split, noise_type, metric)
+        if not path:
             continue
         values = np.asarray(np.load(path), dtype=np.float64)
         style = split_styles.get(split, {"标签_en": split, "标签_zh": split, "颜色": None})
@@ -239,7 +252,8 @@ def plot_metrics_vs_snr(
     fig.tight_layout()
 
     filename = filename or f"{metric}-SNR.png"
-    path = os.path.join(experiment_dir, filename)
+    path = os.path.join(output_dir or os.path.join(experiment_dir, "图像"), filename)
+    ensure_dir(os.path.dirname(path))
     fig.savefig(path, dpi=200)
     plt.close(fig)
     return path
@@ -251,6 +265,7 @@ def plot_metrics_overview(
     split_list: List[str],
     metric_names: List[str],
     lang: str = "en",
+    output_dir: Optional[str] = None,
 ) -> str:
     """绘制三个划分的“整体指标”柱状图（每个指标一个子图）。"""
     overall = summary.get("各划分整体指标", {}) or {}
@@ -273,7 +288,8 @@ def plot_metrics_overview(
         ax.grid(True, axis="y", alpha=0.3)
     fig.suptitle(_text(lang, "Overall metrics by split", "各数据划分的整体指标"))
     fig.tight_layout()
-    path = os.path.join(experiment_dir, "指标总览.png")
+    path = os.path.join(output_dir or os.path.join(experiment_dir, "图像"), "指标总览.png")
+    ensure_dir(os.path.dirname(path))
     fig.savefig(path, dpi=200)
     plt.close(fig)
     return path
@@ -288,14 +304,19 @@ def plot_all(
     lang: str = "en",
     split_list: Optional[List[str]] = None,
     logger: Any = None,
+    output_dir: Optional[str] = None,
 ) -> List[str]:
-    """训练完成后调用：绘制全部图像并返回文件路径列表（需求 6、7）。"""
+    """训练完成后调用：绘制全部图像并返回文件路径列表（需求 6、7）。
+
+    :param output_dir: 图像输出目录，默认写入 ``<实验目录>/图像/``（需求 2 的分目录保存）。
+    """
     lang = configure_fonts(lang)
     summary = read_summary(experiment_dir)
     prefix = summary.get("文件前缀")
     noise_type = summary.get("噪声类型", "EMG")
     metric_names = list(summary.get("评价指标") or ["MSE", "SNR", "CC", "RRMSE"])
     split_list = split_list or ["train", "val", "test"]
+    output_dir = ensure_dir(output_dir or os.path.join(experiment_dir, "图像"))
 
     artifacts: List[str] = []
     history = None
@@ -309,8 +330,8 @@ def plot_all(
             history = None
 
     if history is not None:
-        artifacts.append(plot_loss_curve(experiment_dir, history, lang))
-        path = plot_training_curves(experiment_dir, history, metric_names, lang)
+        artifacts.append(plot_loss_curve(experiment_dir, history, lang, output_dir))
+        path = plot_training_curves(experiment_dir, history, metric_names, lang, output_dir)
         if path:
             artifacts.append(path)
 
@@ -319,11 +340,14 @@ def plot_all(
         path = plot_metrics_vs_snr(
             experiment_dir, metric, noise_type, split_list, snr_levels, lang,
             filename=f"{metric}-SNR.png", draw_reference_line=(metric == "SNR"),
+            output_dir=output_dir,
         )
         if path:
             artifacts.append(path)
 
-    artifacts.append(plot_metrics_overview(experiment_dir, summary, split_list, metric_names, lang))
+    artifacts.append(
+        plot_metrics_overview(experiment_dir, summary, split_list, metric_names, lang, output_dir)
+    )
 
     if callable(logger):
         logger(f"已绘制图像 {len(artifacts)} 张：" + "，".join(os.path.basename(p) for p in artifacts))

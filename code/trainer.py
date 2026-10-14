@@ -25,20 +25,49 @@ from tqdm import tqdm
 
 from config import save_config, runtime_env_info
 from data_prepare import SNR_LEVELS, DataSplit
-from metrics import compute_single_metric, average_by_snr, resolve_metric_selection
+from metrics import (
+    METRIC_REGISTRY,
+    average_by_snr,
+    compute_single_metric,
+    resolve_metric_selection,
+)
 from network import create_model
 from utils import (
-    loss_filename,
-    save_json,
-    experiment_summary_filename,
-    experiment_config_filename,
-    checkpoint_filename,
-    weight_filename,
+    ResultLayout,
     SPLIT_LABELS,
-    metric_filename,
     ensure_dir,
-    train_history_filename,
+    save_json,
 )
+
+
+def metric_higher_is_better(metric_name: str) -> bool:
+    """返回某个指标是否“越大越好”（读 ``metrics`` 包里各指标声明的方向）。
+
+    ``loss`` 一律是越小越好。
+    """
+    if str(metric_name).lower() == "loss":
+        return False
+    from metrics import _discover_all_metrics
+
+    _discover_all_metrics()
+    return bool(METRIC_REGISTRY.get(metric_name, {}).get("是否越大越好", False))
+
+
+def metric_direction_text(metric_name: str) -> str:
+    """返回“越大越好 / 越小越好”的中文描述。"""
+    return "越大越好" if metric_higher_is_better(metric_name) else "越小越好"
+
+
+def is_better(score: float, best: float, metric_name: str) -> bool:
+    """判断当前得分是否优于历史最优（按指标方向）。nan 永远不优于任何值。"""
+    if score is None:
+        return False
+    score = float(score)
+    if not math.isfinite(score):
+        return False
+    if not math.isfinite(best):
+        return True
+    return score > best if metric_higher_is_better(metric_name) else score < best
 
 # --------------------------------------------------------------------------------------
 # 优化器与损失函数
@@ -85,18 +114,40 @@ class DenoiseTrainer:
         experiment_dir: str,
         logger: Callable[..., None],
         device: str,
+        layout: Optional[ResultLayout] = None,
     ) -> None:
         self.config = config
         self.data = data
         self.experiment_dir = experiment_dir
         self.logger = logger
         self.device = device
+        # 结果目录布局：权重/指标/图像/训练配置/划分数据 分目录保存（需求 2）
+        self.layout: ResultLayout = layout or ResultLayout(
+            result_dir=getattr(config, "result_dir", os.path.dirname(experiment_dir)),
+            model_name=getattr(config, "network", "model"),
+            noise_type=data.noise_type,
+            trial=int(getattr(config, "trial", 1) or 1),
+        )
 
         self.prefix: str = config.file_prefix
         self.metric_names: List[str] = resolve_metric_selection(config.metrics)
         self.model: Optional[nn.Module] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.loss_fn = build_loss(config.loss)
+
+        # ---- 最优模型挑选准则（需求 3）----
+        self.select_metric: str = str(getattr(config, "select_metric", "MSE") or "MSE")
+        self.select_split: str = str(getattr(config, "select_split", "val") or "val")
+        if self.select_metric.lower() == "loss":
+            self.select_metric = "loss"
+        elif self.select_metric not in self.metric_names:
+            # 命令行挑选指标与 --metrics 不一致时，自动补进评估指标，保证每轮都能算出来
+            self.metric_names.append(self.select_metric)
+        self.select_higher_is_better = metric_higher_is_better(self.select_metric)
+        self.best_score: float = -float("inf") if self.select_higher_is_better else float("inf")
+        self.best_val_loss = float("inf")
+        self.best_epoch = 0
+        self.epochs_done = 0
 
         # 训练历史：每个 epoch 记录一项，便于画曲线
         self.history: Dict[str, Any] = {
@@ -106,31 +157,44 @@ class DenoiseTrainer:
             "耗时秒": [],
             "lr": [],
             "val_metrics": {name: [] for name in self.metric_names},
+            "各划分指标": {split: {name: [] for name in self.metric_names}
+                        for split in ("train", "val", "test")},
+            "挑选指标值": [],
+            "挑选指标": self.select_metric,
+            "挑选划分": self.select_split,
+            "挑选指标方向": "越大越好" if self.select_higher_is_better else "越小越好",
         }
-        self.best_val_loss = float("inf")
-        self.best_epoch = 0
-        self.epochs_done = 0
 
     # ------------------------------------------------------------------
-    # 路径
+    # 路径（需求 2：分目录保存）
     # ------------------------------------------------------------------
+    def _ensure_dirs(self) -> None:
+        """按需创建结果目录（兼容旧结构：layout 与 experiment_dir 不一致时不建新目录）。"""
+        self.layout.ensure_dirs()
+        ensure_dir(self.experiment_dir)
+
     @property
     def weights_path(self) -> str:
-        return os.path.join(self.experiment_dir, weight_filename(self.prefix, self.config.network))
+        return self.layout.weights_path
 
     @property
     def checkpoint_path(self) -> str:
-        return os.path.join(self.experiment_dir, checkpoint_filename(self.prefix))
+        return self.layout.checkpoint_path
 
     @property
     def history_path(self) -> str:
-        return os.path.join(self.experiment_dir, train_history_filename(self.prefix))
+        return self.layout.history_path
+
+    @property
+    def split_dir(self) -> str:
+        return self.layout.split_dir
+
+    @property
+    def metric_dir(self) -> str:
+        return self.layout.metrics_dir
 
     def _metric_path(self, split: str, metric: str, per_sample: bool = False) -> str:
-        name = metric_filename(split, self.data.noise_type, metric)
-        if per_sample:
-            name = name.replace("_指标.npy", "_逐样本指标.npy")
-        return os.path.join(self.experiment_dir, name)
+        return self.layout.metric_path(split, metric, per_sample=per_sample)
 
     # ------------------------------------------------------------------
     # 构建模型 / 优化器
@@ -252,29 +316,76 @@ class DenoiseTrainer:
         avg_train_loss = sum_squared_error / max(N, 1)
         return avg_train_loss, time.time() - start_time
 
-    def validate_one_epoch(self) -> Tuple[float, Dict[str, float]]:
-        """在验证集上计算 loss 与所选指标（整体值），返回 ``(验证loss, {指标: 值})``。"""
-        val_loss, per_sample, _ = self.inference_stats(
-            self.data.val_noisy,
-            self.data.val_clean,
-            metric_names=self.metric_names,
-        )
+    def evaluate_split(
+        self, split: str, metric_names: Optional[List[str]] = None
+    ) -> Tuple[float, Dict[str, float]]:
+        """在指定划分上计算 loss 与所选指标（整体值），返回 ``(loss, {指标: 值})``。
+
+        ``loss`` 恒为 MSE（与训练损失同一尺度），用于日志与兼容旧结果。
+        """
+        names = list(metric_names or [])
+        noisy, clean, _ = self.data.get(split)
+        if self.config.max_eval_samples:  # 冒烟测试时可限制样本量
+            limit = int(self.config.max_eval_samples)
+            noisy, clean = noisy[:limit], clean[:limit]
+        loss, per_sample, _ = self.inference_stats(noisy, clean, metric_names=names)
         overall_metrics: Dict[str, float] = {}
-        for name in self.metric_names:
+        for name in names:
             with np.errstate(invalid="ignore"):
-                overall_metrics[name] = float(np.nanmean(per_sample[name])) if per_sample[name].size else float("nan")
-        return val_loss, overall_metrics
+                overall_metrics[name] = (
+                    float(np.nanmean(per_sample[name])) if per_sample[name].size else float("nan")
+                )
+        return loss, overall_metrics
+
+    def validate_one_epoch(self) -> Tuple[float, Dict[str, float]]:
+        """在验证集上计算 loss 与所选指标（保留旧接口）。"""
+        return self.evaluate_split("val", self.metric_names)
 
     # ------------------------------------------------------------------
     # 主训练流程
     # ------------------------------------------------------------------
     def train(self, start_epoch: int = 1) -> None:
-        """从 ``start_epoch`` 训练到 ``config.epochs``，并保存最优权重与断点。"""
+        """从 ``start_epoch`` 训练到 ``config.epochs``，并保存最优权重与断点。
+
+        最优模型的挑选规则（需求 3）由 ``--select-split`` 与 ``--select-metric`` 决定：
+        每个 epoch 都会在训练/验证/测试集上计算所选指标，然后按
+        ``<划分>_<指标>``（默认 ``val_MSE``）的最优值保存权重。
+        """
         assert self.model is not None
-        self.logger(f"开始训练：轮次 {start_epoch} -> {self.config.epochs}")
+        self._ensure_dirs()
+        self.logger(
+            f"开始训练：轮次 {start_epoch} -> {self.config.epochs}；"
+            f"最优模型挑选准则 = {self.select_split}_{self.select_metric}"
+            f"（{metric_direction_text(self.select_metric)}）"
+        )
+        if self.select_split == "train":
+            self.logger("[提示] 当前按训练集指标挑选最优模型，容易过拟合，通常不推荐。")
+        elif self.select_split == "test":
+            self.logger("[提示] 当前按测试集指标挑选最优模型，测试集信息会泄漏进模型选择，写论文时务必说明。")
+
         for epoch in range(start_epoch, int(self.config.epochs) + 1):
             train_loss, elapsed = self.train_one_epoch(epoch)
-            val_loss, val_metrics = self.validate_one_epoch()
+
+            # ① 先算“挑选准则”所在的划分（默认验证集），拿到 loss 与指标
+            criterion_loss, criterion_metrics = self.evaluate_split(
+                self.select_split, self.metric_names
+            )
+            val_loss = (
+                criterion_loss if self.select_split == "val"
+                else self.evaluate_split("val", [])[0]
+            )
+            # ② 其余划分也各算一次所选指标，便于事后比较不同挑选准则的差异
+            split_metrics: Dict[str, Dict[str, float]] = {}
+            for split in ("train", "val", "test"):
+                if split == self.select_split:
+                    split_metrics[split] = dict(criterion_metrics)
+                else:
+                    split_metrics[split] = self.evaluate_split(split, self.metric_names)[1]
+
+            criterion_value = (
+                float(criterion_loss) if self.select_metric == "loss"
+                else float(criterion_metrics.get(self.select_metric, float("nan")))
+            )
 
             # 记录历史
             self.history["epochs"].append(epoch)
@@ -282,37 +393,61 @@ class DenoiseTrainer:
             self.history["val_loss"].append(float(val_loss))
             self.history["耗时秒"].append(float(elapsed))
             self.history["lr"].append(float(self.optimizer.param_groups[0]["lr"]))
+            self.history["挑选指标值"].append(float(criterion_value))
             for name in self.metric_names:
-                self.history["val_metrics"][name].append(float(val_metrics[name]))
+                self.history["val_metrics"][name].append(
+                    float(split_metrics["val"].get(name, float("nan")))
+                )
+                for split in ("train", "val", "test"):
+                    self.history["各划分指标"][split][name].append(
+                        float(split_metrics[split].get(name, float("nan")))
+                    )
             self.epochs_done = epoch
 
-            metric_text = "，".join(f"{name}={val_metrics[name]:.6g}" for name in self.metric_names)
+            metric_text = "，".join(
+                f"{name}={split_metrics['val'][name]:.6g}" for name in self.metric_names
+            )
             self.logger(
                 f"Epoch {epoch}/{self.config.epochs} 完成，耗时 {elapsed:.1f}s，"
-                f"train_loss={train_loss:.6g}，val_loss={val_loss:.6g}"
-                + (f"，{metric_text}" if metric_text else "")
+                f"train_loss={train_loss:.6g}，val_loss={val_loss:.6g}，"
+                f"挑选值({self.select_split}_{self.select_metric})={criterion_value:.6g}"
+                + (f"，验证集指标：{metric_text}" if metric_text else "")
             )
 
             # 挑选并保存最优模型（best_start_ratio 用于兼容原版“只在前 80% 之后才挑最优”的规则）
             is_eligible = epoch > float(self.config.epochs) * float(self.config.best_start_ratio)
-            if is_eligible and val_loss < self.best_val_loss:
-                self.best_val_loss = float(val_loss)
+            if is_eligible and is_better(criterion_value, self.best_score, self.select_metric):
+                self.best_score = float(criterion_value)
+                if math.isfinite(criterion_loss):
+                    self.best_val_loss = float(criterion_loss)
                 self.best_epoch = epoch
                 self.save_weights(self.weights_path)
-                self.logger(f"  ↳ 新的最优模型：val_loss={val_loss:.8g}（第 {epoch} 轮）")
+                self.logger(
+                    f"  ↳ 新的最优模型：{self.select_split}_{self.select_metric}="
+                    f"{criterion_value:.8g}（第 {epoch} 轮）"
+                )
 
             # 保存断点（默认每个 epoch 都保存，可用 --checkpoint-every 降低频率）
             every_n_epochs = max(1, int(getattr(self.config, "checkpoint_every", 1)))
             if epoch % every_n_epochs == 0 or epoch == int(self.config.epochs):
                 self.save_checkpoint(epoch)
 
-        # 若一次都没被选中（例如 epochs 很小），用最后一轮兜底
+        # 若一次都没被选中（例如 epochs 很小或指标全是 nan），用最后一轮兜底
         if self.best_epoch == 0:
+            self.best_epoch = self.epochs_done
+            if self.history["挑选指标值"]:
+                self.best_score = float(self.history["挑选指标值"][-1])
             if self.history["val_loss"]:
                 self.best_val_loss = float(self.history["val_loss"][-1])
-            self.best_epoch = self.epochs_done
             self.save_weights(self.weights_path)
-            self.logger(f"训练轮数较少，已用最后一轮权重作为最优模型（val_loss={self.best_val_loss:.8g}）")
+            self.logger(
+                f"没有任何一轮满足挑选条件，已用最后一轮权重作为最优模型"
+                f"（{self.select_split}_{self.select_metric}={self.best_score:.8g}）"
+            )
+        self.logger(
+            f"最优模型：第 {self.best_epoch} 轮，{self.select_split}_{self.select_metric}="
+            f"{self.best_score:.8g}，val_loss={self.best_val_loss:.8g}"
+        )
 
     # ------------------------------------------------------------------
     # 保存 / 加载
@@ -329,7 +464,13 @@ class DenoiseTrainer:
                 "datanum": int(self.data.signal_length),
                 "noise_type": self.data.noise_type,
                 "epoch": int(self.best_epoch),
+                # 需求 3：记录最优模型是按哪个数据集、哪个指标挑选出来的
+                "挑选划分": self.select_split,
+                "挑选指标": self.select_metric,
+                "挑选指标方向": metric_direction_text(self.select_metric),
+                "挑选指标值": float(self.best_score),
                 "val_loss": float(self.best_val_loss),
+                "随机种子": getattr(self.config, "seed", None),
             },
             path,
         )
@@ -345,6 +486,7 @@ class DenoiseTrainer:
     def save_checkpoint(self, epoch: int) -> None:
         """保存断点文件（模型 + 优化器 + epoch + 历史 + 随机数状态），用于恢复训练。"""
         assert self.model is not None and self.optimizer is not None
+        ensure_dir(os.path.dirname(os.path.abspath(self.checkpoint_path)))
         torch.save(
             {
                 "epoch": int(epoch),
@@ -355,6 +497,9 @@ class DenoiseTrainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "best_val_loss": float(self.best_val_loss),
                 "best_epoch": int(self.best_epoch),
+                "best_score": float(self.best_score),
+                "挑选划分": self.select_split,
+                "挑选指标": self.select_metric,
                 "history": self.history,
                 "torch_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -379,11 +524,25 @@ class DenoiseTrainer:
         self.best_val_loss = float(content.get("best_val_loss", float("inf")))
         self.best_epoch = int(content.get("best_epoch", 0))
         self.epochs_done = int(content.get("epoch", 0))
+        self.best_score = float(
+            content.get(
+                "best_score",
+                -float("inf") if self.select_higher_is_better else float("inf"),
+            )
+        )
         if content.get("history"):
             self.history = content["history"]
-            # 兼容：历史里可能缺少新选择的指标
+            # 兼容：历史里可能缺少新选择的指标 / 新增的字段
             for name in self.metric_names:
                 self.history.setdefault("val_metrics", {}).setdefault(name, [])
+            self.history.setdefault("各划分指标", {})
+            for split in ("train", "val", "test"):
+                self.history["各划分指标"].setdefault(split, {})
+                for name in self.metric_names:
+                    self.history["各划分指标"][split].setdefault(name, [])
+            self.history.setdefault("挑选指标值", [])
+            self.history.setdefault("挑选指标", self.select_metric)
+            self.history.setdefault("挑选划分", self.select_split)
         if content.get("torch_rng_state") is not None:
             try:
                 torch.set_rng_state(content["torch_rng_state"].cpu())
@@ -396,7 +555,8 @@ class DenoiseTrainer:
 
         self.logger(
             f"已从断点恢复：已完成 {self.epochs_done} 轮，"
-            f"历史最优 val_loss={self.best_val_loss:.8g}（第 {self.best_epoch} 轮）"
+            f"历史最优 {self.select_split}_{self.select_metric}={self.best_score:.8g}"
+            f"（第 {self.best_epoch} 轮），val_loss={self.best_val_loss:.8g}"
         )
         return self.epochs_done + 1
 
@@ -404,9 +564,10 @@ class DenoiseTrainer:
     # 结束后：保存 loss / 指标 / 摘要
     # ------------------------------------------------------------------
     def save_loss(self) -> str:
-        """保存训练过程的 loss（需求 5：``<前缀>_Loss.npy``）。"""
+        """保存训练过程的 loss（需求 5：``<前缀>_Loss.npy``，写入 ``指标/`` 子目录）。"""
         assert self.model is not None
-        path = os.path.join(self.experiment_dir, loss_filename(self.prefix))
+        self._ensure_dirs()
+        path = self.layout.loss_path
         np.save(
             path,
             {
@@ -418,7 +579,7 @@ class DenoiseTrainer:
             },
         )
         # 另外保存完整训练历史（含逐轮验证指标），便于画指标-epoch 曲线
-        np.save(self.history_path, self.history)
+        np.save(self.layout.history_path, self.history)
         return path
 
     def evaluate_and_save_metrics(self, weights: Optional[str] = None) -> Dict[str, Dict[str, float]]:
@@ -431,7 +592,8 @@ class DenoiseTrainer:
             self.load_weights(weights)
 
         summary: Dict[str, Dict[str, float]] = {}
-        snr_levels_path = os.path.join(self.experiment_dir, "SNR档位.npy")
+        self._ensure_dirs()
+        snr_levels_path = self.layout.snr_levels_path
         np.save(snr_levels_path, SNR_LEVELS)
 
         for split in self.config.eval_splits:
@@ -460,11 +622,15 @@ class DenoiseTrainer:
                     f"{name}={overall[name]:.6g}" for name in self.metric_names
                 )
             )
+
+        # 整体指标单独落盘：K 次独立实验的统计汇总与方差分析都直接读这个文件
+        save_json(self.layout.overall_metrics_path, summary)
         return summary
 
     def save_summary(self, summary: Dict[str, Dict[str, float]], elapsed_seconds: float) -> str:
-        """保存实验摘要 JSON（最优轮次、各划分整体指标、环境信息等）。"""
-        path = os.path.join(self.experiment_dir, experiment_summary_filename())
+        """保存实验摘要 JSON（最优轮次、各划分整体指标、挑选准则、环境信息等）。"""
+        self._ensure_dirs()
+        path = self.layout.summary_path
         save_json(
             path,
             {
@@ -475,7 +641,13 @@ class DenoiseTrainer:
                 "信号长度": self.data.signal_length,
                 "文件前缀": self.prefix,
                 "实验目录": self.experiment_dir,
+                "试验次数": int(self.layout.trial),
+                "随机种子": getattr(self.config, "seed", None),
+                "最优模型挑选划分": self.select_split,
+                "最优模型挑选指标": self.select_metric,
+                "最优模型挑选方向": metric_direction_text(self.select_metric),
                 "最优轮次": int(self.best_epoch),
+                "最优挑选指标值": float(self.best_score),
                 "最优验证损失": float(self.best_val_loss),
                 "已完成轮次": int(self.epochs_done),
                 "总训练耗时秒": float(elapsed_seconds),
@@ -503,6 +675,7 @@ class DenoiseTrainer:
         start = time.time()
         if self.model is None:
             self.build()
+        self._ensure_dirs()
 
         start_epoch = 1
         if resume:
@@ -518,7 +691,7 @@ class DenoiseTrainer:
             self.load_weights(extra_weights)
 
         # 重新保存一次配置（恢复训练时相当于记录本次使用的参数）
-        save_config(self.config, os.path.join(self.experiment_dir, experiment_config_filename()))
+        save_config(self.config, self.layout.config_path)
 
         self.train(start_epoch=start_epoch)
         self.save_loss()
@@ -534,6 +707,9 @@ class DenoiseTrainer:
             "摘要": summary_path,
             "历史最优轮次": int(self.best_epoch),
             "历史最优验证损失": float(self.best_val_loss),
+            "历史最优挑选指标值": float(self.best_score),
+            "挑选划分": self.select_split,
+            "挑选指标": self.select_metric,
             "各划分整体指标": summary,
         }
         self.logger(f"训练结束，结果保存在：{self.experiment_dir}")

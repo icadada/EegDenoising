@@ -16,7 +16,7 @@
 
     python code/main.py --network Simple_CNN --noise-type EMG --epochs 50
     python code/main.py --network MyNewNet --model-kwargs '{"width": 32, "use_bn": true}'
-    python code/main.py --config code/results/xxx/训练配置.json      # 完全复现某次实验
+    python code/main.py --config results/Simple_CNN/EMG去噪_512HZ/试验次数_1/训练配置/训练配置.json
 """
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ from typing import Any, Dict, List, Optional
 from utils import (
     save_json,
     load_json,
-    get_script_root,
     get_project_root,
     default_file_prefix,
 )
@@ -39,7 +38,7 @@ from utils import (
 # --------------------------------------------------------------------------------------
 
 #: 所有模型共用的全局默认值。
-#: 数值取自原版 EEGdenoiseNet V2 的 ``main.py``（epochs=50、batch_size=40、RMSprop lr=5e-5）。
+#: 数值取自原版 EEGdenoiseNet V2 的 ``main.py``（batch_size=40、RMSprop lr=5e-5）。
 GLOBAL_DEFAULT_HYPERPARAMS: Dict[str, Any] = {
     "epochs": 50,          # 训练轮数
     "batch_size": 40,      # 批大小
@@ -50,16 +49,53 @@ GLOBAL_DEFAULT_HYPERPARAMS: Dict[str, Any] = {
     "loss": "mse",         # 损失函数：mse / rmse
 }
 
-#: 每个模型的**训练超参数默认值**（需求 4：写好每个模型训练时候的默认值）。
-#: 五个基准网络在原论文/原代码中都用 50 epoch、batch 40、RMSprop lr=5e-5，
-#: 这里按模型分开存放，方便以后单独微调某一个模型而不影响其他模型。
-MODEL_DEFAULT_HYPERPARAMS: Dict[str, Dict[str, Any]] = {
-    "fcNN":        {"epochs": 50, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
-    "Simple_CNN":  {"epochs": 50, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
-    "Complex_CNN": {"epochs": 50, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
-    "RNN_lstm":    {"epochs": 50, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
-    "Novel_CNN":   {"epochs": 50, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+#: 每个模型的**训练超参数默认值**（按噪声类型 EMG / EOG 分别给出，需求 1）。
+#: 五个基准网络在原论文/原代码中的最佳轮数在 EMG 与 EOG 两种噪声下不同，
+#: 因此这里按 ``{噪声类型: {模型名: {...}}}`` 两层存放，方便单独微调某一个模型。
+MODEL_DEFAULT_HYPERPARAMS: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "EMG": {
+        "fcNN":        {"epochs": 60, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "Simple_CNN":  {"epochs": 10, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "Complex_CNN": {"epochs": 10, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "RNN_lstm":    {"epochs": 60, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "Novel_CNN":   {"epochs": 60, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+    },
+    "EOG": {
+        "fcNN":        {"epochs": 60, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "Simple_CNN":  {"epochs": 40, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "Complex_CNN": {"epochs": 40, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "RNN_lstm":    {"epochs": 100, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+        "Novel_CNN":   {"epochs": 100, "batch_size": 40, "lr": 5e-5, "optimizer": "rmsprop"},
+    },
 }
+
+
+def model_default_hyperparams(model_name: Optional[str], noise_type: Optional[str]) -> Dict[str, Any]:
+    """取某个模型在某种噪声类型下的默认超参数（需求 1）。
+
+    兼容两种写法：``{"EMG": {模型: {...}}, "EOG": {...}}``（当前写法），
+    以及旧版的 ``{模型: {...}}``（没有噪声维度时直接返回模型默认值）。
+    """
+    if not model_name:
+        return {}
+    noise_key = str(noise_type or "").upper()
+    table: Any = MODEL_DEFAULT_HYPERPARAMS
+    if noise_key in table and isinstance(table[noise_key], dict):
+        return dict(table[noise_key].get(model_name, {}) or {})
+    # 旧版结构（没有噪声类型这一层）
+    if model_name in table and isinstance(table[model_name], dict):
+        return dict(table[model_name])
+    return {}
+
+
+def _per_model_default(key: str) -> Dict[str, Any]:
+    """生成 ``{噪声类型: {模型名: 值}}`` 形式的“每模型默认值”，供 TypedArgumentParser 使用。"""
+    result: Dict[str, Dict[str, Any]] = {}
+    for noise_type, model_table in MODEL_DEFAULT_HYPERPARAMS.items():
+        if not isinstance(model_table, dict):
+            continue  # 兼容旧版结构
+        result[noise_type] = {m: v.get(key) for m, v in model_table.items() if isinstance(v, dict)}
+    return result
 
 #: 每个模型的**结构初始化参数默认值**，会在创建模型时透传给模型构造函数。
 #: 这些值同时也可以通过 ``--model-kwargs`` / ``--model-arg`` 在命令行覆盖。
@@ -90,6 +126,23 @@ class TypedArgumentParser(argparse.ArgumentParser):
         super().__init__(*args, **kwargs)
         # 记录每个参数的元信息（类型/全局默认/每模型默认），用于按模型注入默认值
         self._meta: Dict[str, Dict[str, Any]] = {}
+        #: 记录命令行显式给出的参数名（dest），供“多模型 K 次实验”时区分用户显式值
+        self.explicit_dests: set = set()
+
+    # ------------------------------------------------------------------
+    class _TrackExplicit(argparse.Action):
+        """记录“该参数是否由命令行显式给出”（用于把用户显式值带到每个模型的实验中）。"""
+
+        def __call__(self, parser: Any, namespace: Any, values: Any, option_string: Any = None) -> None:
+            parser.explicit_dests.add(self.dest)
+            setattr(namespace, self.dest, values)
+
+    class _TrackExplicitAppend(argparse._AppendAction):
+        """与 ``_TrackExplicit`` 相同，但保留 argparse 的 append 语义。"""
+
+        def __call__(self, parser: Any, namespace: Any, values: Any, option_string: Any = None) -> None:
+            parser.explicit_dests.add(self.dest)
+            super().__call__(parser, namespace, values, option_string)
 
     # ------------------------------------------------------------------
     def add_typed(
@@ -109,7 +162,13 @@ class TypedArgumentParser(argparse.ArgumentParser):
         - ``group``：把参数放进某个 argparse 参数组，仅影响 ``--help`` 的显示。
         """
         per_model_default = kwargs.pop("per_model_default", None)
-        # 先用 argparse.SUPPRESS 作为默认值占位，真正的默认值在 parse_typed() 里按优先级注入
+        # 先用 argparse.SUPPRESS 作为默认值占位，真正的默认值在 parse_typed() 里按优先级注入；
+        # 同时用自定义 action 记录“哪些参数是命令行显式给出的”
+        action = kwargs.pop("action", None)
+        if action is None:
+            kwargs["action"] = TypedArgumentParser._TrackExplicit
+        elif action == "append":
+            kwargs["action"] = TypedArgumentParser._TrackExplicitAppend
         target = group if group is not None else self
         target.add_argument(*flags, type=type, default=argparse.SUPPRESS, **kwargs)
         dest = self._dest(flags)
@@ -127,11 +186,13 @@ class TypedArgumentParser(argparse.ArgumentParser):
     def parse_typed(self, argv: Optional[List[str]] = None) -> argparse.Namespace:
         """按优先级解析参数，并返回类型正确的命名空间。"""
         argv = list(sys.argv[1:] if argv is None else argv)
+        self.explicit_dests = set()  # 记录命令行显式给出的参数名
 
-        # ① 预解析，先拿到 --config 与 --network，用于确定“默认值表”
+        # ① 预解析，先拿到 --config / --network / --noise-type，用于确定“默认值表”
         pre_parser = argparse.ArgumentParser(add_help=False)
         pre_parser.add_argument("--config", default=None)
         pre_parser.add_argument("--network", default=None)
+        pre_parser.add_argument("--noise-type", default=None)
         pre_args, _ = pre_parser.parse_known_args(argv)
 
         full_config: Dict[str, Any] = {}
@@ -149,14 +210,21 @@ class TypedArgumentParser(argparse.ArgumentParser):
             or self._meta.get("network", {}).get("全局默认")
         )
 
-        # ② 组装最终默认值：全局默认 <- 该模型默认 <- 配置文件
+        # ② 组装最终默认值：全局默认 <- 该模型在该噪声类型下的默认 <- 配置文件
         defaults: Dict[str, Any] = {}
         for dest, meta in self._meta.items():
             if meta["全局默认"] is not None or dest in GLOBAL_DEFAULT_HYPERPARAMS:
                 defaults[dest] = meta["全局默认"]
         defaults.update(GLOBAL_DEFAULT_HYPERPARAMS)
-        if model_name and model_name in MODEL_DEFAULT_HYPERPARAMS:
-            defaults.update(MODEL_DEFAULT_HYPERPARAMS[model_name])
+
+        # 噪声类型优先级：命令行 > 配置文件 > 解析器默认值（决定采用哪一套模型默认超参数）
+        noise_type = (
+            pre_args.noise_type
+            or file_config.get("noise_type")
+            or self._meta.get("noise_type", {}).get("全局默认")
+            or "EMG"
+        )
+        defaults.update(model_default_hyperparams(model_name, noise_type))
         # 配置文件里出现的键全部生效（含 --model-kwargs 这类字符串参数）
         for key, value in file_config.items():
             if key in self._meta:
@@ -180,6 +248,9 @@ class TypedArgumentParser(argparse.ArgumentParser):
         # ⑥ 补全派生字段：文件前缀、采样率等
         if not getattr(config, "file_prefix", None):
             config.file_prefix = default_file_prefix(config.noise_type)
+        # 记录“显式来源”（命令行 > 配置文件），供多模型 K 次实验时正确套用各模型默认值
+        config._explicit_dests = set(self.explicit_dests)
+        config._file_config_keys = set(file_config.keys())
         return config
 
     # ------------------------------------------------------------------
@@ -273,15 +344,16 @@ def build_parser(available_networks: Optional[List[str]] = None, available_metri
     group = parser.add_argument_group("数据与路径")
     parser.add_typed("--data-dir", type=str, default=os.path.join(get_project_root(), "data"),
               help="数据目录（存放 EEG_all_epochs_512hz.npy 等）", group=group)
-    parser.add_typed("--result-dir", type=str, default=os.path.join(get_script_root(), "results"),
-              help="实验结果根目录，每次实验在其中新建一个文件夹", group=group)
+    parser.add_typed("--result-dir", type=str, default=os.path.join(get_project_root(), "results"),
+              help="实验结果根目录（与 code、data 同级），每次实验在其中新建文件夹", group=group)
     parser.add_typed("--noise-type", type=str, default="EMG", choices=["EMG", "EOG"],
               help="噪声类型：EMG(512Hz) 或 EOG(256Hz)", group=group)
     parser.add_typed("--file-prefix", type=str, default=None,
               help="统一文件前缀（Loss/权重/实验文件夹名），默认 测试集_<噪声>去噪_<采样率>HZ",
               group=group)
     parser.add_typed("--trial", type=int, default=None,
-              help="试验次数编号，用于区分多次重复实验；不填则自动取下一个编号", group=group)
+              help="试验次数编号（仅单次训练模式使用；K 次独立重复实验模式固定为 1..K，忽略该参数）",
+              group=group)
     parser.add_typed("--config", type=str, default=None,
               help="从 JSON 配置文件加载参数（优先级低于命令行）", group=group)
 
@@ -289,6 +361,9 @@ def build_parser(available_networks: Optional[List[str]] = None, available_metri
     group = parser.add_argument_group("网络与模型")
     parser.add_typed("--network", type=str, default="Simple_CNN", choices=available_networks,
               help="要训练的网络名（network/ 目录下新增 .py 会自动出现在这里）", group=group)
+    parser.add_typed("--models", type=str, default=None, nargs="+",
+              help="依次训练多个模型（一轮 K 次独立重复实验后自动做 ANOVA + Tukey HSD）；"
+                   "不填则只训练 --network 指定的一个模型", group=group)
     parser.add_typed("--model-kwargs", type=str, default=None, action="append",
               help='透传给模型构造函数的额外参数，JSON 字符串，如 \'{"dropout":0.2}\'；'
                    "可重复传入，后者覆盖前者", group=group)
@@ -296,23 +371,43 @@ def build_parser(available_networks: Optional[List[str]] = None, available_metri
               help="透传给模型构造函数的额外参数，key=value 形式，如 --model-arg width=32 use_bn=true",
               group=group)
 
+    # ---------------- 多次独立重复实验（K 次） ----------------
+    group = parser.add_argument_group("多次独立重复实验（K 次独立实验，非 K 折交叉验证）")
+    parser.add_typed("--repeat-k", type=int, default=10,
+              help="每个模型独立重复实验的次数 K：每次都用新的随机种子重新随机混合生成半仿真数据、"
+                   "重新划分训练/验证/测试集并随机初始化网络权重，默认 10", group=group)
+    parser.add_typed("--clean", type=int, default=1, choices=[0, 1],
+              help="开始前是否清空该模型在该噪声类型下的全部历史结果（该噪声类型的 K 次实验文件夹与汇总文件），"
+                   "1=清空（默认，保证结果只属于本轮 K 次实验），0=保留", group=group)
+    parser.add_typed("--run-significance", type=int, default=1, choices=[0, 1],
+              help="训练完成后是否自动做单因素方差分析（ANOVA）与 Tukey HSD 事后检验并画箱线图，1=做（默认）",
+              group=group)
+
     # ---------------- 训练超参数 ----------------
-    group = parser.add_argument_group("训练超参数（按模型有各自默认值）")
+    group = parser.add_argument_group("训练超参数（默认值按 噪声类型 + 模型 取，见 MODEL_DEFAULT_HYPERPARAMS）")
     parser.add_typed("--epochs", type=int, default=GLOBAL_DEFAULT_HYPERPARAMS["epochs"],
-              per_model_default={m: v.get("epochs") for m, v in MODEL_DEFAULT_HYPERPARAMS.items()},
-              help="训练轮数", group=group)
+              per_model_default=_per_model_default("epochs"),
+              help="训练轮数（默认值随噪声类型 EMG/EOG 与该模型变化）", group=group)
     parser.add_typed("--batch-size", type=int, default=GLOBAL_DEFAULT_HYPERPARAMS["batch_size"],
-              per_model_default={m: v.get("batch_size") for m, v in MODEL_DEFAULT_HYPERPARAMS.items()},
+              per_model_default=_per_model_default("batch_size"),
               help="批大小", group=group)
     parser.add_typed("--lr", type=float, default=GLOBAL_DEFAULT_HYPERPARAMS["lr"],
-              per_model_default={m: v.get("lr") for m, v in MODEL_DEFAULT_HYPERPARAMS.items()},
+              per_model_default=_per_model_default("lr"),
               help="学习率", group=group)
     parser.add_typed("--optimizer", type=str, default="rmsprop", choices=["rmsprop", "adam", "sgd"],
-              per_model_default={m: v.get("optimizer") for m, v in MODEL_DEFAULT_HYPERPARAMS.items()},
+              per_model_default=_per_model_default("optimizer"),
               help="优化器：rmsprop(alpha=0.9) / adam(betas=0.5,0.9) / sgd(momentum=0.9)", group=group)
     parser.add_typed("--loss", type=str, default="mse", choices=["mse", "rmse"],
-              help="损失函数", group=group)
-    parser.add_typed("--seed", type=int, default=42, help="随机种子（设为 -1 表示不固定种子）", group=group)
+              help="损失函数（训练时反向传播用的损失，与“最优模型挑选指标”无关）", group=group)
+    parser.add_typed("--select-metric", type=str, default="MSE",
+              choices=["loss"] + list(available_metrics),
+              help="挑选最优模型所用的指标，默认 MSE（越小越好；SNR/CC 越大越好；loss 始终越小越好）",
+              group=group)
+    parser.add_typed("--select-split", type=str, default="val", choices=["train", "val", "test"],
+              help="挑选最优模型所用的数据划分，默认 val（验证集）", group=group)
+    parser.add_typed("--seed", type=int, default=42,
+              help="基础随机种子；第 i 次独立实验实际使用 seed+i-1（会被记录到配置与摘要里；"
+                   "-1 表示不固定种子）", group=group)
     parser.add_typed("--device", type=str, default="auto",
               help="训练设备：auto / cpu / cuda:0", group=group)
     parser.add_typed("--shuffle", type=int, default=1, choices=[0, 1],
@@ -350,7 +445,8 @@ def build_parser(available_networks: Optional[List[str]] = None, available_metri
               help="图像文字语言：en=英文（默认，无需中文字体），zh=中文（需系统装有中文字体）",
               group=group)
     parser.add_typed("--plot-only", type=str, default=None,
-              help="只对已有实验重新绘图，不训练。填结果文件夹名、完整路径或 latest", group=group)
+              help="只对已有实验重新绘图，不训练。填试验文件夹名、模型文件夹、噪声文件夹、完整路径或 latest",
+              group=group)
 
     # ---------------- 恢复训练 ----------------
     group = parser.add_argument_group("恢复训练")
@@ -371,7 +467,7 @@ def config_to_dict(config: argparse.Namespace) -> Dict[str, Any]:
     train_params: Dict[str, Any] = {}
     others: Dict[str, Any] = {}
     for key, value in vars(config).items():
-        if key == "model_args":
+        if key == "model_args" or key.startswith("_"):  # 内部字段（如显式来源记录）不落盘
             continue
         try:  # 过滤掉不可序列化的对象
             import json

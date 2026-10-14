@@ -2,11 +2,28 @@
 
 本模块集中放置与具体模型/指标无关的小工具，主要包含三类内容：
 
-1. **统一文件命名规则**（本项目的核心约定）
-   所有产出文件的名字都由这里生成，保证命名风格一致，便于批量读取与对比。
-   命名示例（EMG、512Hz、Simple_CNN、第 1 次实验）：:
+1. **统一文件命名规则 + 结果目录结构**（本项目的核心约定）
+   所有产出文件的名字与目录都由这里生成，保证命名风格一致，便于批量读取与对比。
 
-        实验文件夹 : 测试集_EMG去噪_512HZ_试验次数_1
+   ``results/`` 与 ``code/``、``data/`` **同级**，目录结构如下（EMG、512Hz、Simple_CNN、K=10）::
+
+       results/
+       └── Simple_CNN/                                  <- ① 模型名
+           └── EMG去噪_512HZ/                            <- ② 噪声类型（<噪声>去噪_<采样率>HZ）
+               ├── 指标汇总_均值标准差中位数IQR.json        <- K 次实验各指标的 Mean/STD/Median/IQR
+               ├── EMG_显著性检验.json / .csv             <- ③ ANOVA + Tukey HSD 结果
+               ├── 图像/                                  <- ④ 显著性标注的箱线图
+               ├── 试验次数_1/                            <- ⑤ 第 1 次独立重复实验
+               │   ├── 权重/        测试集_EMG去噪_512HZ_Simple_CNN.pt / *_断点续训.pt
+               │   ├── 指标/        *_Loss.npy / <划分>_EMG去噪_512HZ_<指标>_指标.npy
+               │   ├── 图像/        *.png
+               │   ├── 训练配置/    训练配置.json / 实验摘要.json
+               │   ├── 训练日志.txt
+               │   └── 划分数据/    划分信息.json / *.npy
+               └── 试验次数_2/ ... 试验次数_K/
+
+   命名示例（EMG、512Hz、Simple_CNN、第 1 次实验）::
+
         Loss     : 测试集_EMG去噪_512HZ_Loss.npy            <- 训练过程 loss
         权重      : 测试集_EMG去噪_512HZ_Simple_CNN.pt       <- 最优模型权重
         断点      : 测试集_EMG去噪_512HZ_断点续训.pt          <- 用于恢复训练
@@ -14,9 +31,9 @@
                     训练集_EMG去噪_512HZ_MSE_指标.npy        <- 训练集 MSE 指标
                     验证集_EMG去噪_512HZ_MSE_指标.npy        <- 验证集 MSE 指标
 
-2. **路径/IO 小工具**：建目录、存读 JSON、存读 npy、设备选择、随机种子。
+2. **路径/IO 小工具**：建目录、存读 JSON、存读 npy、设备选择、随机种子、结果目录布局。
 
-3. **日志**：既打印到终端，也追加写入实验结果文件夹下的 ``训练日志.txt``。
+3. **日志**：既打印到终端，也追加写入结果文件夹下的 ``训练日志.txt``。
 
 注意：本模块只依赖 numpy，不依赖 torch，方便单独测试。
 """
@@ -26,7 +43,8 @@ import json
 import os
 import random
 import time
-from typing import Any, Dict, Iterable, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -117,6 +135,308 @@ def split_data_dirname() -> str:
 
 
 # --------------------------------------------------------------------------------------
+# 一（补）、结果目录结构（模型 / 噪声类型 / 试验次数 三层）
+# --------------------------------------------------------------------------------------
+
+#: 单次实验文件夹内部的子目录名（== 需求 2：权重、指标、图像、配置、划分数据分开存放）
+SUBDIR_WEIGHTS = "权重"
+SUBDIR_METRICS = "指标"
+SUBDIR_PLOTS = "图像"
+SUBDIR_CONFIG = "训练配置"
+SUBDIR_SPLIT = "划分数据"
+
+#: 汇总文件名
+AGGREGATE_FILENAME = "指标汇总_均值标准差中位数IQR.json"
+
+
+def clean_subdir_names() -> Tuple[str, ...]:
+    """返回需要在“清空实验结果”时一并删除的、可自动重建的子目录名。"""
+    return (SUBDIR_WEIGHTS, SUBDIR_METRICS, SUBDIR_PLOTS, SUBDIR_SPLIT)
+
+
+def results_root_default() -> str:
+    """默认结果根目录：``<项目根>/results``（与 ``code/``、``data/`` 同级）。"""
+    return os.path.join(get_project_root(), "results")
+
+
+def resolve_result_root(result_dir: Optional[str]) -> str:
+    """解析结果根目录。
+
+    - 传入 ``None`` / 空字符串：返回默认的 ``<项目根>/results``（与 code、data 同级）；
+    - 传入相对路径：相对于**项目根目录**解析（而不是当前工作目录），
+      这样从任何地方执行 ``python code/main.py`` 结果都落在同一个地方；
+    - 传入绝对路径：原样返回。
+    """
+    text = str(result_dir).strip() if result_dir is not None else ""
+    if not text:
+        return results_root_default()
+    if os.path.isabs(text):
+        return os.path.normpath(text)
+    return os.path.normpath(os.path.join(get_project_root(), text))
+
+
+def model_results_dir(result_dir: str, model_name: str) -> str:
+    """返回某模型的结果目录：``<结果根>/<模型名>``。"""
+    return os.path.join(result_dir, str(model_name))
+
+
+def noise_label_dir(noise_type: str) -> str:
+    """返回噪声文件夹名，形如 ``EMG去噪_512HZ``（``<噪声类型>去噪_<采样率>HZ``）。"""
+    return noise_label(noise_type)
+
+
+def noise_results_dir(result_dir: str, model_name: str, noise_type: str) -> str:
+    """返回某模型某噪声类型的结果目录：``<结果根>/<模型名>/<噪声>去噪_<采样率>HZ``。"""
+    return os.path.join(model_results_dir(result_dir, model_name), noise_label_dir(noise_type))
+
+
+def make_layout(result_dir: str, model_name: str, noise_type: str, trial: int) -> "ResultLayout":
+    """创建（并返回）一次独立重复实验的结果目录布局对象。"""
+    return ResultLayout(
+        result_dir=result_dir, model_name=str(model_name), noise_type=noise_type, trial=int(trial)
+    )
+
+
+@dataclass
+class ResultLayout:
+    """一次独立重复实验（模型 + 噪声类型 + 第 N 次实验）的完整目录布局。
+
+    目录结构::
+
+        <结果根>/<模型名>/<噪声>去噪_<采样率>HZ/试验次数_<N>/
+        ├── 权重/        最优权重与断点续训文件
+        ├── 指标/        Loss / 训练历史 / 指标 npy / SNR档位.npy
+        ├── 图像/        自动生成的 *.png
+        ├── 训练配置/     训练配置.json / 实验摘要.json / 各划分整体指标.json
+        ├── 训练日志.txt
+        └── 划分数据/     划分好的数据集
+    """
+
+    result_dir: str
+    model_name: str
+    noise_type: str
+    trial: int
+
+    # ---------------- 目录 ----------------
+    @property
+    def noise_dir(self) -> str:
+        """噪声类型目录：``<结果根>/<模型名>/<噪声>去噪_<采样率>HZ``。"""
+        return noise_results_dir(self.result_dir, self.model_name, self.noise_type)
+
+    @property
+    def model_dir(self) -> str:
+        """模型目录：``<结果根>/<模型名>``。"""
+        return model_results_dir(self.result_dir, self.model_name)
+
+    @property
+    def trial_dirname(self) -> str:
+        """单次实验文件夹名，形如 ``试验次数_1``。"""
+        return format_trial_name(self.trial)
+
+    @property
+    def experiment_dir(self) -> str:
+        """单次实验文件夹（trial 级目录）。"""
+        return os.path.join(self.noise_dir, self.trial_dirname)
+
+    @property
+    def weights_dir(self) -> str:
+        return os.path.join(self.experiment_dir, SUBDIR_WEIGHTS)
+
+    @property
+    def metrics_dir(self) -> str:
+        return os.path.join(self.experiment_dir, SUBDIR_METRICS)
+
+    @property
+    def plots_dir(self) -> str:
+        return os.path.join(self.experiment_dir, SUBDIR_PLOTS)
+
+    @property
+    def config_dir(self) -> str:
+        return os.path.join(self.experiment_dir, SUBDIR_CONFIG)
+
+    @property
+    def split_dir(self) -> str:
+        return os.path.join(self.experiment_dir, SUBDIR_SPLIT)
+
+    @property
+    def significance_dir(self) -> str:
+        """显著性检验结果目录：``<噪声目录>/统计分析``。"""
+        return os.path.join(self.noise_dir, "统计分析")
+
+    @property
+    def noise_plots_dir(self) -> str:
+        """噪声类型级别的图像目录（存放箱线图等跨实验图像）。"""
+        return os.path.join(self.noise_dir, "图像")
+
+    # ---------------- 文件 ----------------
+    @property
+    def prefix(self) -> str:
+        """统一文件前缀，形如 ``测试集_EMG去噪_512HZ``。"""
+        return default_file_prefix(self.noise_type)
+
+    @property
+    def weights_path(self) -> str:
+        return os.path.join(self.weights_dir, weight_filename(self.prefix, self.model_name))
+
+    @property
+    def checkpoint_path(self) -> str:
+        return os.path.join(self.weights_dir, checkpoint_filename(self.prefix))
+
+    @property
+    def loss_path(self) -> str:
+        return os.path.join(self.metrics_dir, loss_filename(self.prefix))
+
+    @property
+    def history_path(self) -> str:
+        return os.path.join(self.metrics_dir, train_history_filename(self.prefix))
+
+    @property
+    def snr_levels_path(self) -> str:
+        return os.path.join(self.metrics_dir, "SNR档位.npy")
+
+    @property
+    def config_path(self) -> str:
+        return os.path.join(self.config_dir, experiment_config_filename())
+
+    @property
+    def summary_path(self) -> str:
+        return os.path.join(self.config_dir, experiment_summary_filename())
+
+    @property
+    def overall_metrics_path(self) -> str:
+        return os.path.join(self.config_dir, "各划分整体指标.json")
+
+    @property
+    def log_path(self) -> str:
+        return os.path.join(self.experiment_dir, "训练日志.txt")
+
+    @property
+    def aggregate_path(self) -> str:
+        """K 次实验汇总文件（Mean/STD/Median/IQR），位于噪声类型目录下。"""
+        return os.path.join(self.noise_dir, AGGREGATE_FILENAME)
+
+    def metric_path(self, split: str, metric: str, per_sample: bool = False) -> str:
+        """指标 npy 路径，例如 ``指标/测试集_EMG去噪_512HZ_MSE_指标.npy``。"""
+        name = metric_filename(split, self.noise_type, metric)
+        if per_sample:
+            name = name.replace("_指标.npy", "_逐样本指标.npy")
+        return os.path.join(self.metrics_dir, name)
+
+    def ensure_dirs(self) -> "ResultLayout":
+        """创建全部子目录。"""
+        for directory in (
+            self.weights_dir, self.metrics_dir, self.plots_dir, self.config_dir, self.split_dir
+        ):
+            ensure_dir(directory)
+        return self
+
+    def describe(self) -> str:
+        """返回人可读的目录说明（写进日志用）。"""
+        return (
+            f"模型目录：{self.model_dir}\n"
+            f"噪声目录：{self.noise_dir}\n"
+            f"本次实验：{self.experiment_dir}"
+        )
+
+
+def format_trial_name(trial: int) -> str:
+    """试验次数的显示名，形如 ``试验次数_1``。"""
+    return f"试验次数_{int(trial)}"
+
+
+def parse_trial_name(name: str) -> Optional[int]:
+    """从 ``实验文件夹名`` 或 ``试验次数_3`` 中解析出试验编号，失败返回 None。"""
+    text = str(name)
+    for prefix in ("试验次数_", "_试验次数_"):
+        index = text.rfind(prefix)
+        if index >= 0:
+            tail = text[index + len(prefix):]
+            if tail.isdigit():
+                return int(tail)
+    return None
+
+
+def find_result_layouts(result_dir: str) -> List[ResultLayout]:
+    """扫描结果目录，返回全部 ``试验次数_N`` 实验的布局对象（按路径排序）。
+
+    兼容两种结构：
+
+    - 新结构：``<结果根>/<模型名>/<噪声>去噪_<采样率>HZ/试验次数_N/``
+    - 旧结构：``<结果根>/<模型名>/试验次数_N/``
+
+    参数既可以是**结果根目录**，也可以是**单个模型目录**（``<结果根>/<模型名>``），
+    两种写法都能正确找出其下的全部实验。
+    """
+    layouts: List[ResultLayout] = []
+    seen = set()
+
+    def add(result_root: str, model_name: str, noise_type: str, trial: int) -> None:
+        key = (os.path.abspath(result_root), model_name, noise_type, int(trial))
+        if key in seen:
+            return
+        seen.add(key)
+        layouts.append(ResultLayout(result_root, model_name, noise_type, int(trial)))
+
+    def scan_trials(result_root: str, model_name: str, noise_type: str, container: str) -> None:
+        """扫描 ``container`` 下的 ``试验次数_N`` 目录并登记。"""
+        try:
+            names = sorted(os.listdir(container))
+        except OSError:
+            return
+        for name in names:
+            trial = parse_trial_name(name) if name.startswith("试验次数_") else None
+            if trial is not None and os.path.isdir(os.path.join(container, name)):
+                add(result_root, model_name, noise_type, trial)
+
+    if not os.path.isdir(result_dir):
+        return layouts
+
+    root = os.path.abspath(result_dir)
+
+    # 情况 0：传进来的本身就是“噪声目录”（<模型>/<噪声>去噪_<采样率>HZ）
+    root_noise_type = _noise_type_from_dirname(os.path.basename(root))
+    if root_noise_type:
+        scan_trials(os.path.dirname(os.path.dirname(root)), os.path.basename(os.path.dirname(root)),
+                    root_noise_type, root)
+        return layouts
+
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        noise_type = _noise_type_from_dirname(name)
+        if noise_type:
+            # 传进来的就是“模型目录”（root），其下直接是 <噪声>去噪_<采样率>HZ
+            model_name = os.path.basename(root)
+            result_root = os.path.dirname(root)
+            scan_trials(result_root, model_name, noise_type, path)
+            continue
+        # 传进来的是“结果根目录”，name 是模型名
+        for sub_name in sorted(os.listdir(path)):
+            sub_path = os.path.join(path, sub_name)
+            if not os.path.isdir(sub_path):
+                continue
+            sub_noise_type = _noise_type_from_dirname(sub_name)
+            if sub_noise_type:
+                scan_trials(root, name, sub_noise_type, sub_path)
+            else:
+                # 旧结构：<模型>/试验次数_N（没有噪声层级，按目录名猜噪声类型）
+                trial = parse_trial_name(sub_name)
+                if trial is not None:
+                    add(root, name, _noise_type_from_dirname(root) or "EMG", trial)
+    return layouts
+
+
+def _noise_type_from_dirname(dirname: str) -> Optional[str]:
+    """从 ``EMG去噪_512HZ`` 这样的目录名里还原噪声类型（``EMG`` / ``EOG``）。"""
+    upper = str(dirname).upper()
+    for noise_type in NOISE_SAMPLE_RATE:
+        if upper.startswith(noise_type):
+            return noise_type
+    return None
+
+
+# --------------------------------------------------------------------------------------
 # 二、路径与 IO
 # --------------------------------------------------------------------------------------
 
@@ -157,6 +477,117 @@ def load_npy_dict(path: str) -> Dict[str, Any]:
     if isinstance(obj, np.ndarray) and obj.dtype == object and obj.shape == ():
         return obj.item()
     return obj
+
+
+def find_in_run_dir(experiment_dir: str, filename: str) -> Optional[str]:
+    """在单次实验文件夹里查找文件。
+
+    由于需求 2 把结果分到了 ``权重/指标/图像/训练配置/划分数据`` 等子目录，
+    这里先在已知子目录里找，再退回实验文件夹根目录（兼容旧结构）。
+    """
+    for subdir in clean_subdir_names() + (SUBDIR_CONFIG,):
+        candidate = os.path.join(experiment_dir, subdir, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    candidate = os.path.join(experiment_dir, filename)
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def find_summary_path(experiment_dir: str) -> Optional[str]:
+    """查找 ``实验摘要.json``（新结构在 ``训练配置/`` 下，旧结构在根目录）。"""
+    return find_in_run_dir(experiment_dir, experiment_summary_filename())
+
+
+def find_overall_metrics_path(experiment_dir: str) -> Optional[str]:
+    """查找 ``各划分整体指标.json``（由 trainer 落盘，K 次实验汇总时读取）。"""
+    return find_in_run_dir(experiment_dir, "各划分整体指标.json")
+
+
+def find_loss_path(experiment_dir: str, prefix: str) -> Optional[str]:
+    """查找 ``<前缀>_Loss.npy``。"""
+    return find_in_run_dir(experiment_dir, loss_filename(prefix))
+
+
+def find_train_history_path(experiment_dir: str, prefix: str) -> Optional[str]:
+    """查找 ``<前缀>_训练历史.npy``。"""
+    return find_in_run_dir(experiment_dir, train_history_filename(prefix))
+
+
+def find_metric_path(experiment_dir: str, split: str, noise_type: str, metric: str,
+                     per_sample: bool = False) -> Optional[str]:
+    """查找某个划分/指标的 npy 文件。"""
+    name = metric_filename(split, noise_type, metric)
+    if per_sample:
+        name = name.replace("_指标.npy", "_逐样本指标.npy")
+    return find_in_run_dir(experiment_dir, name)
+
+
+def read_overall_metrics(experiment_dir: str) -> Dict[str, Dict[str, float]]:
+    """读取一次实验在三个划分上的整体指标。
+
+    优先读 ``训练配置/各划分整体指标.json``（内容最完整），其次退回 ``实验摘要.json``。
+    """
+    path = find_overall_metrics_path(experiment_dir)
+    if path:
+        try:
+            data = load_json(path)
+            if isinstance(data, dict) and data:
+                return {k: dict(v) for k, v in data.items() if isinstance(v, dict)}
+        except Exception:
+            pass
+    path = find_summary_path(experiment_dir)
+    if path:
+        try:
+            summary = load_json(path)
+            overall = summary.get("各划分整体指标", {}) or {}
+            return {k: dict(v) for k, v in overall.items() if isinstance(v, dict)}
+        except Exception:
+            pass
+    return {}
+
+
+def read_trial_metrics(experiment_dir: str, metric: str, split: str = "test") -> Optional[float]:
+    """读取一次实验在指定划分上的某个指标的整体值（K 次统计与方差分析用）。
+
+    优先读落盘的整体指标；若缺失，则用 ``<划分>_<噪声>去噪_<采样率>HZ_<指标>_逐样本指标.npy``
+    就地重新计算（整体值 = 逐样本指标的 nanmean）。
+    """
+    overall = read_overall_metrics(experiment_dir)
+    value = (overall.get(split) or {}).get(metric)
+    if value is not None and np.isfinite(float(value)):
+        return float(value)
+
+    noise_type = detect_noise_type(experiment_dir)
+    if noise_type is None:
+        return None if value is None else float(value)
+    path = find_metric_path(experiment_dir, split, noise_type, metric, per_sample=True)
+    if path:
+        values = np.asarray(np.load(path), dtype=np.float64).reshape(-1)
+        if values.size:
+            with np.errstate(invalid="ignore"):
+                return float(np.nanmean(values))
+    if value is None:
+        return None
+    return float(value)
+
+
+def detect_noise_type(experiment_dir: str) -> Optional[str]:
+    """推断一次实验用的噪声类型：先看目录名，再看实验摘要。"""
+    upper = os.path.abspath(str(experiment_dir)).upper()
+    for noise_type in NOISE_SAMPLE_RATE:
+        if f"{noise_type}去噪_" in upper:
+            return noise_type
+    path = find_summary_path(experiment_dir)
+    if path:
+        try:
+            noise_type = str(load_json(path).get("噪声类型", "")).upper()
+            if noise_type in NOISE_SAMPLE_RATE:
+                return noise_type
+        except Exception:
+            pass
+    return None
 
 
 # --------------------------------------------------------------------------------------
@@ -216,17 +647,18 @@ class Logger:
 def next_trial_index(result_dir: str, prefix: str) -> int:
     """扫描结果目录，返回下一个可用的试验次数（用于避免覆盖之前的实验结果）。
 
-    例如已存在 ``..._试验次数_1``、``..._试验次数_2``，则返回 3。
+    扫描时**递归**查找 ``试验次数_N`` 目录，因此新旧两种目录结构都能正确递增。
     """
-    if not os.path.isdir(result_dir):
-        return 1
     trials = []
-    for name in os.listdir(result_dir):
-        base = experiment_dirname(prefix, 0).rsplit("_", 1)[0]  # 去掉末尾数字后作为前缀
-        if name.startswith(base + "_"):
-            tail = name[len(base) + 1 :]
-            if tail.isdigit():
-                trials.append(int(tail))
+    for root, dirnames, _ in os.walk(result_dir):
+        if os.path.abspath(root).count(os.sep) - os.path.abspath(result_dir).count(os.sep) > 4:
+            dirnames[:] = []
+            continue
+        for name in dirnames:
+            if name.startswith("试验次数_"):
+                tail = name[len("试验次数_"):]
+                if tail.isdigit():
+                    trials.append(int(tail))
     return (max(trials) + 1) if trials else 1
 
 

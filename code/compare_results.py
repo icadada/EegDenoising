@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """实验结果对比绘图工具（需求 11）。
 
-功能：从 ``code/results`` 下的多个实验结果文件夹中，分别读取 loss、MSE、SNR(dB)、
+功能：从 ``results/`` 下的多个实验结果文件夹中，分别读取 loss、MSE、SNR(dB)、
 CC、RRMSE 等指标（npy 文件），绘制成对比图。**本脚本不会自动运行**，需要手动执行。
+
+目录结构说明：结果按 ``results/<模型名>/<噪声>去噪_<采样率>HZ/试验次数_N/`` 分层存放，
+每个实验内部再分为 ``权重/ 指标/ 图像/ 训练配置/ 划分数据/`` 子目录。本脚本会
+**递归发现** 全部 ``试验次数_N`` 实验（也兼容旧的平铺结构）。
 
 用法示例
 --------
 对比全部实验（测试集、全部指标）::
 
-    python code/compare_results.py --result-dir code/results --split test
+    python code/compare_results.py --result-dir results --split test
 
-只对比指定的几个实验，并指定输出目录::
+只对比某个模型的全部 K 次实验::
 
-    python code/compare_results.py --result-dir code/results \
-        --experiments 测试集_EMG去噪_512HZ_试验次数_1 测试集_EMG去噪_512HZ_试验次数_2 \
-        --metrics MSE SNR CC RRMSE --split test --out code/results/对比图
+    python code/compare_results.py --result-dir results/Simple_CNN --split test
 
-同时对比三个划分::
+只对比指定的几个实验文件夹，并指定输出目录::
 
-    python code/compare_results.py --result-dir code/results --split train val test
+    python code/compare_results.py --result-dir results \
+        --experiments results/Simple_CNN/EMG去噪_512HZ/试验次数_1 \
+                      results/fcNN/EMG去噪_512HZ/试验次数_1 \
+        --metrics MSE SNR CC RRMSE --split test --out results/对比图
 
 产出
 ----
@@ -57,7 +62,14 @@ from plotting import (  # noqa: E402
     read_snr_levels,
     read_train_history,
 )
-from utils import experiment_summary_filename, ensure_dir, SPLIT_LABELS  # noqa: E402
+from utils import (  # noqa: E402
+    SPLIT_LABELS,
+    ensure_dir,
+    find_result_layouts,
+    find_summary_path,
+    read_overall_metrics as read_overall_metrics_from_dir,
+    resolve_result_root,
+)
 
 #: 从文件夹名里提取“试验次数”的正则
 _TRIAL_RE = re.compile(r"_试验次数_(\d+)")
@@ -76,7 +88,7 @@ color_cycle = [
 def discover_experiments(result_dir: str, specified: Optional[Sequence[str]] = None) -> List[str]:
     """返回实验结果文件夹列表（按名字排序）。
 
-    :param 指定: 需要对比的实验文件夹名或路径；为 ``None`` 时自动发现结果目录下所有实验
+    :param specified: 需要对比的实验文件夹名或路径；为 ``None`` 时自动递归发现结果目录下所有实验
     """
     if specified:
         result: List[str] = []
@@ -92,15 +104,26 @@ def discover_experiments(result_dir: str, specified: Optional[Sequence[str]] = N
 
     experiment_list: List[str] = []
     # 结果目录本身就是一个实验文件夹的情况
-    if os.path.isfile(os.path.join(result_dir, experiment_summary_filename())):
+    if _TRIAL_RE.search(os.path.basename(os.path.normpath(result_dir))) and find_summary_path(result_dir):
         experiment_list.append(os.path.abspath(result_dir))
-    # 结果目录下每个含“实验摘要.json”的子目录都算一个实验
-    for name in sorted(os.listdir(result_dir)):
-        subdir = os.path.join(result_dir, name)
-        if os.path.isfile(os.path.join(subdir, experiment_summary_filename())):
-            experiment_list.append(os.path.abspath(subdir))
+    # ① 推荐方式：按 <模型>/<噪声>/试验次数_N 结构递归发现
+    for layout in find_result_layouts(result_dir):
+        if os.path.isdir(layout.experiment_dir):
+            experiment_list.append(os.path.abspath(layout.experiment_dir))
+    # ② 兼容旧的平铺结构：任何含“实验摘要.json”的一级/二级子目录
+    for depth in (1, 2):
+        pattern_root = result_dir
+        for name in sorted(os.listdir(pattern_root)):
+            subdir = os.path.join(pattern_root, name)
+            if os.path.isdir(subdir) and find_summary_path(subdir):
+                path = os.path.abspath(subdir)
+                if path not in experiment_list:
+                    experiment_list.append(path)
+    experiment_list = sorted(set(experiment_list))
     if not experiment_list:
-        raise FileNotFoundError(f"{result_dir} 下没有找到任何实验结果（缺少 {experiment_summary_filename()}）")
+        raise FileNotFoundError(
+            f"{result_dir} 下没有找到任何实验结果（缺少 训练配置/实验摘要.json）"
+        )
     return experiment_list
 
 
@@ -128,12 +151,9 @@ def experiment_display_name(experiment_dir: str, lang: str = "en") -> str:
 
 
 def read_overall_metrics(experiment_dir: str, split: str) -> Dict[str, float]:
-    """读取实验摘要里的整体指标（读取失败返回空字典）。"""
-    try:
-        summary = read_summary(experiment_dir)
-    except Exception:
-        return {}
-    return dict((summary.get("各划分整体指标", {}) or {}).get(split, {}) or {})
+    """读取实验的整体指标（新结构读 ``训练配置/各划分整体指标.json``，兼容实验摘要）。"""
+    overall = read_overall_metrics_from_dir(experiment_dir)
+    return dict(overall.get(split, {}) or {})
 
 
 # --------------------------------------------------------------------------------------
@@ -294,10 +314,10 @@ def save_comparison_csv(
 def build_comparison_parser() -> argparse.ArgumentParser:
     """构建对比脚本的命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="从 code/results 中读取多次实验的指标并绘制对比图（需求 11）"
+        description="从 results 中读取多次实验的指标并绘制对比图（需求 11）"
     )
-    parser.add_argument("--result-dir", default=os.path.join(CODE_DIR, "results"),
-                      help="实验结果根目录")
+    parser.add_argument("--result-dir", default=None,
+                      help="实验结果根目录（默认 <项目根>/results，与 code、data 同级）")
     parser.add_argument("--experiments", nargs="*", default=None,
                       help="要对比的实验文件夹名（默认自动发现全部）")
     parser.add_argument("--metrics", nargs="+", default=["MSE", "SNR", "CC", "RRMSE"],
@@ -314,6 +334,7 @@ def build_comparison_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_comparison_parser().parse_args(argv)
     lang = configure_fonts(args.lang)
+    args.result_dir = resolve_result_root(args.result_dir)
     output_dir = ensure_dir(args.out or os.path.join(args.result_dir, "对比图"))
 
     experiment_list = discover_experiments(args.result_dir, args.experiments)
