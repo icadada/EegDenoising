@@ -578,8 +578,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-samples", type=int, default=None,
                         help="最多画多少个测试样本（默认全部；调试时可用 --max-samples 5）")
     parser.add_argument("--snr", nargs="+", default=None, metavar="SNR",
-                        help="用测试集的哪个 SNR 档位：worst(默认，最难) / best / mid / all，"
-                             "或具体数值（如 -7 -4 0）；多档时文件名会带 _SNR-7dB 后缀")
+                        help="用测试集的哪个 SNR 档位：worst(默认，最难 -7dB) / best / mid / all，"
+                             "或具体数值（如 -7 -4 0）；每个档位在样本目录下建一个 <SNR>dB 子文件夹")
     parser.add_argument("--no-annotate", action="store_true",
                         help="不在图上写输入 SNR（默认会写一行小标题）")
     parser.add_argument("--sample-index-offset", type=int, default=1,

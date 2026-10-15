@@ -393,8 +393,9 @@ def build_parser(available_networks: Optional[List[str]] = None, available_metri
     parser.add_typed("--infer-device", type=str, default=None,
               help="推理使用的设备（默认与训练相同）", group=group)
     parser.add_typed("--infer-snr", type=str, nargs="+", default=None, metavar="SNR",
-              help="推理用测试集的哪个 SNR 档位：worst(默认，最难) / best / mid / all，"
-                   "或具体数值（如 -7 -4 0）", group=group)
+              help="推理用测试集的哪个 SNR 档位：worst(默认，最难 -7dB) / best / mid / all，"
+                   "或具体数值（如 -7 -4 0）；每个档位在样本目录下建一个 <SNR>dB 子文件夹",
+              group=group)
 
     # ---------------- 训练超参数 ----------------
     group = parser.add_argument_group("训练超参数（默认值按 噪声类型 + 模型 取，见 MODEL_DEFAULT_HYPERPARAMS）")
