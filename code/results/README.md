@@ -20,13 +20,13 @@ results/
 │           └── 划分数据/                        # 本次实验划分好的数据集
 └── 对比图/                                     # ★ 所有“论文用图”集中在这里（尺寸统一 1080x1080）
     └── <噪声类型>去噪_<采样率>Hz/               # 例如 EMG去噪_512Hz（注意是 Hz）
-        ├── <标签>_对比_CC_test.png              # 横轴 SNR(dB)、纵轴 CC；曲线 = K 次均值，阴影 = ±1 标准差
+        ├── <标签>_对比_CC_test.png              # 横轴 SNR(dB)、纵轴 CC；曲线 = K 次均值，阴影 = ±1 标准差（--shade none 可关）
         ├── <标签>_对比_MSE_test.png
         ├── <标签>_对比_SNR_test.png
         ├── <标签>_对比_RRMSE_test.png
         ├── <标签>_对比_训练Loss.png             # 每个模型只画 K 次里验证集 MSE 最低的那一次
         ├── <标签>_对比_验证Loss.png
-        ├── <标签>_显著性检验_<指标>_箱线图.png   # 带 Tukey HSD 逐对显著性标注（* / ** / ***）
+        ├── <标签>_显著性检验_<指标>_箱线图.png   # 带 Tukey HSD 逐对显著性标注（* / ** / ***），不画 K 次散点
         ├── <标签>_显著性检验_统计表.csv          # 箱线图的 n/中位数/均值/标准差/Q1/Q3/IQR
         ├── <标签>_显著性检验说明.md              # 图上 * 的含义 + ANOVA/Tukey 结论
         ├── <标签>_对比汇总_test.csv              # 每一次实验一行（含随机种子），便于自己再统计
@@ -55,6 +55,10 @@ python code/main.py --models fcNN Simple_CNN Complex_CNN RNN_lstm Novel_CNN \
 
 # ③ 生成论文用对比图（按噪声类型分目录；曲线 = K 次均值 ± 标准差）
 python code/compare_results.py --result-dir results --highlight Novel_CNN
+
+# ③' 只要均值曲线、不画阴影；或换中位数±IQR
+python code/compare_results.py --result-dir results --shade none
+python code/compare_results.py --result-dir results --aggregate median --shade iqr
 
 # ④ 单独做显著性检验（可对已有结果反复执行）
 python code/significance_test.py --noise-type EMG --highlight Novel_CNN

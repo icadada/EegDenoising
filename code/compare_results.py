@@ -6,9 +6,11 @@
 
 核心约定
 --------
-1. **K 次独立重复实验聚合成每个模型一条曲线**：曲线 = K 次实验的**均值**，
-   阴影 = ±1 **标准差**（`--aggregate mean_std`，默认）；也可选 ``mean_sem``（标准误）、
-   ``median_iqr``（中位数 ± 四分位距/2），或 ``all``（把 K 次全画出来）。
+1. **K 次独立重复实验聚合成每个模型一条曲线**，两个参数分别控制“中心曲线”和“误差带”：
+   - ``--aggregate mean``（默认，均值）/ ``median``（中位数）/ ``all``（K 次全部画细线）；
+   - ``--shade std``（默认，±标准差）/ ``sem``（±标准误）/ ``iqr``（±四分位距/2）/
+     ``none``（**不画阴影**，只要均值曲线）。
+   两个参数自由组合，例如 ``--aggregate mean --shade none`` 就是只有均值折线。
 2. 输出按**噪声类型**分目录（EMG/EOG 的 SNR 范围与图尺寸不同，混在一起无法统一）::
 
        results/对比图/
@@ -38,7 +40,11 @@
 
     python code/compare_results.py --noise-type EMG --highlight Novel_CNN
 
-10 次实验全部画出来（不聚合）::
+只画均值曲线、不要阴影::
+
+    python code/compare_results.py --shade none
+
+10 次实验全部画出来（不聚合，细线）::
 
     python code/compare_results.py --aggregate all
 """
@@ -85,10 +91,18 @@ _TRIAL_RE = re.compile(r"试验次数_(\d+)")
 FIG_SIZE: Tuple[float, float] = (5.4, 5.4)
 DPI = 200
 
-#: 曲线颜色循环
+#: 曲线颜色循环：取“高区分度 + 色盲友好”的一组颜色（相邻两个模型不会撞色）
 COLOR_CYCLE = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    "#0072B2",  # 深蓝
+    "#E69F00",  # 琥珀黄
+    "#009E73",  # 翠绿
+    "#8B0000",  # 深红（比 --highlight 的红色更暗，两者不会混淆）
+    "#6A3D9A",  # 深紫
+    "#8C564B",  # 棕
+    "#E377C2",  # 粉
+    "#7F7F7F",  # 中灰
+    "#BCBD22",  # 橄榄黄
+    "#17BECF",  # 青
 ]
 
 #: 重点模型专用色（--highlight）
@@ -200,35 +214,44 @@ def load_metric_curves(
     return snr_levels, matrix
 
 
-def summarise(matrix: np.ndarray, aggregate: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """把 ``(K,N)`` 的 K 次重复聚合成 ``(中心曲线, 误差带)``。
+def summarise(matrix: np.ndarray, aggregate: str = "mean", shade: str = "std"
+              ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """把 ``(K,N)`` 的 K 次重复聚合成 ``(中心曲线, 误差带或None)``。
 
-    - ``mean_std``：均值 ± 标准差
-    - ``mean_sem``：均值 ± 标准误（std/√K）
-    - ``median_iqr``：中位数 ± 四分位距/2
+    :param aggregate: ``mean``（均值）或 ``median``（中位数）
+    :param shade: 误差带类型；``none`` 表示**不画阴影**，只画中心曲线
+        - ``std``：标准差
+        - ``sem``：标准误（std/√K）
+        - ``iqr``：四分位距/2
     """
     with np.errstate(invalid="ignore"):
-        if aggregate == "median_iqr":
-            center = np.nanmedian(matrix, axis=0)
+        center = (np.nanmedian(matrix, axis=0) if aggregate == "median"
+                  else np.nanmean(matrix, axis=0))
+        if shade == "none" or matrix.shape[0] < 2:
+            return center, None
+        if shade == "iqr":
             q1 = np.nanpercentile(matrix, 25, axis=0)
             q3 = np.nanpercentile(matrix, 75, axis=0)
             return center, (q3 - q1) / 2.0
-        center = np.nanmean(matrix, axis=0)
-        std = (np.nanstd(matrix, axis=0, ddof=1) if matrix.shape[0] > 1
-               else np.zeros(matrix.shape[1]))
-        if aggregate == "mean_sem":
+        std = np.nanstd(matrix, axis=0, ddof=1)
+        if shade == "sem":
             return center, std / np.sqrt(max(matrix.shape[0], 1))
         return center, std
 
 
-def band_label(aggregate: str) -> str:
-    """误差带的说明文字。"""
-    return {
-        "mean_std": "mean±STD",
-        "mean_sem": "mean±SEM",
-        "median_iqr": "median±IQR/2",
-        "all": "all runs",
-    }.get(aggregate, aggregate)
+def center_label(aggregate: str, shrink: float = 1.0) -> str:
+    """中心曲线的说明文字（``shrink`` 用于 ``--aggregate all`` 时的曲线变细说明）。"""
+    if aggregate == "median":
+        return "median"
+    return "mean"
+
+
+def band_label(aggregate: str, shade: str) -> str:
+    """中心曲线 + 误差带的说明文字，例如 ``mean±STD`` / ``mean``（不画阴影）。"""
+    name = center_label(aggregate)
+    if shade == "none" or aggregate == "all":
+        return name
+    return f"{name}±{shade.upper() if shade != 'iqr' else 'IQR/2'}"
 
 
 # --------------------------------------------------------------------------------------
@@ -321,10 +344,15 @@ def plot_metric_vs_snr(
     metric: str,
     output_dir: str,
     tag: str,
-    aggregate: str = "mean_std",
+    aggregate: str = "mean",
+    shade: str = "std",
     highlight: Optional[str] = None,
 ) -> Optional[str]:
-    """画“横轴 SNR、纵轴某指标”的模型对比图（K 次实验聚合成均值±标准差）。"""
+    """画“横轴 SNR、纵轴某指标”的模型对比图。
+
+    ``aggregate`` 决定中心曲线（mean/median，``all`` = 每条实验各画一条），
+    ``shade`` 决定是否画误差带（std/sem/iqr/none）。
+    """
     fig, ax = plt.subplots()
     has_data = False
     for index, model in enumerate(model_names_in_order(layouts)):
@@ -336,16 +364,17 @@ def plot_metric_vs_snr(
             COLOR_CYCLE[index % len(COLOR_CYCLE)]
         label = f"{model}*" if (highlight and model == highlight) else model
         if aggregate == "all":
+            # 每一次实验各画一条细线（只用于细节核查，牺牲可读性换信息量）
             for run_index in range(matrix.shape[0]):
-                ax.plot(snr, matrix[run_index], color=color, linewidth=0.9, alpha=0.35,
+                ax.plot(snr, matrix[run_index], color=color, linewidth=0.8, alpha=0.28,
                         label=label if run_index == 0 else None)
         else:
-            center, band = summarise(matrix, aggregate)
-            if band is not None:
+            center, band = summarise(matrix, aggregate, shade)
+            if band is not None:  # shade == "none" 时 band 为 None，即不画阴影
                 ax.fill_between(snr, center - band, center + band, color=color, alpha=0.18,
                                 linewidth=0)
-            ax.plot(snr, center, color=color, linewidth=1.8, marker="o", markersize=4,
-                    label=label)
+            ax.plot(snr, center, color=color, linewidth=1.9, marker="o", markersize=4.5,
+                    markeredgecolor="white", markeredgewidth=0.6, label=label)
         has_data = True
     if not has_data:
         plt.close(fig)
@@ -356,7 +385,7 @@ def plot_metric_vs_snr(
     style_axes(ax)
     ax.legend(fontsize=8.5, framealpha=0.9, edgecolor="#999999", loc="best")
     if highlight:
-        ax.text(0.985, 0.02, f"* {highlight}   {band_label(aggregate)}",
+        ax.text(0.985, 0.02, f"* {highlight}   {band_label(aggregate, shade)}",
                 transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
                 color=HIGHLIGHT_COLOR)
     return save_square(fig, os.path.join(output_dir, f"{tag}_对比_{metric}_{split}.png"))
@@ -446,10 +475,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="要对比的指标")
     parser.add_argument("--split", nargs="+", default=["test"],
                         choices=["train", "val", "test"], help="对比哪个数据划分（可多选）")
-    parser.add_argument("--aggregate", default="mean_std",
-                        choices=["mean_std", "mean_sem", "median_iqr", "all"],
-                        help="K 次实验的聚合方式：均值±标准差（默认）/ 均值±标准误 / "
-                             "中位数±IQR/2 / 全部画出")
+    parser.add_argument("--aggregate", default="mean", choices=["mean", "median", "all"],
+                        help="K 次实验聚合成中心曲线的方式：mean=均值（默认）/ median=中位数 / "
+                             "all=把 K 次全部画出来（细线）")
+    parser.add_argument("--shade", default="std", choices=["std", "sem", "iqr", "none"],
+                        help="中心曲线周围的误差带：std=±标准差（默认）/ sem=±标准误 / "
+                             "iqr=±四分位距/2 / none=不画阴影（只要均值曲线）")
     parser.add_argument("--highlight", default=None,
                         help="重点模型名（红色突出显示、图例写 <模型>*，一般用来标出自己提出的模型）")
     parser.add_argument("--out", default=None,
@@ -483,12 +514,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_dir = comparison_dir(result_dir, tag) if args.out is None else ensure_dir(args.out)
         models = model_names_in_order(layouts)
         print(f"\n[{noise_type}] {tag}：{len(layouts)} 次实验，模型 {models}")
-        print(f"  聚合方式：{band_label(args.aggregate)}；输出目录：{output_dir}")
+        print(f"  中心曲线：{center_label(args.aggregate)}；误差带：{args.shade}"
+              f"（{band_label(args.aggregate, args.shade)}）；输出目录：{output_dir}")
 
         for split in args.split:
             for metric in args.metrics:
                 path = plot_metric_vs_snr(layouts, noise_type, split, metric, output_dir, tag,
-                                          aggregate=args.aggregate, highlight=args.highlight)
+                                          aggregate=args.aggregate, shade=args.shade,
+                                          highlight=args.highlight)
                 if path:
                     artifacts.append(path)
                     print(f"  - {os.path.basename(path)}")

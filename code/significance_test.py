@@ -85,10 +85,18 @@ METRIC_DISPLAY_EN: Dict[str, str] = {
     "RRMSE": "RRMSE",
 }
 
-#: 箱线图颜色循环
+#: 箱线图颜色循环（与 compare_results.py 完全一致的高区分度配色）
 COLOR_CYCLE = [
-    "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
-    "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD",
+    "#0072B2",  # 深蓝
+    "#E69F00",  # 琥珀黄
+    "#009E73",  # 翠绿
+    "#8B0000",  # 深红（比 highlight 的红色更暗，避免混淆）
+    "#6A3D9A",  # 深紫
+    "#8C564B",  # 棕
+    "#E377C2",  # 粉
+    "#7F7F7F",  # 中灰
+    "#BCBD22",  # 橄榄黄
+    "#17BECF",  # 青
 ]
 
 
@@ -619,11 +627,12 @@ def plot_boxplot_with_significance(
     box = ax.boxplot(
         data,
         positions=positions,
-        widths=0.62,
+        widths=0.66,
         patch_artist=True,
         showmeans=False,
         tick_labels=labels,
-        medianprops={"color": "#FF7F0E", "linewidth": 2.0},   # 参考图：橙色中位线
+        # 中位线要细：箱体本身较扁时，粗中位线会把整个箱体占满
+        medianprops={"color": "#FF7F0E", "linewidth": 1.1},
         boxprops={"linewidth": 1.1, "edgecolor": "#222222"},
         whiskerprops={"linewidth": 1.0, "linestyle": "-"},
         capprops={"linewidth": 1.0},
@@ -637,13 +646,6 @@ def plot_boxplot_with_significance(
         else:
             patch.set_facecolor(COLOR_CYCLE[index % len(COLOR_CYCLE)])
             patch.set_alpha(0.75)
-
-    # 叠加 K 次实验的原始散点（轻微抖动），比“均值±方差”信息更多
-    rng = np.random.default_rng(20240101)
-    for x_position, values in zip(positions, data):
-        jitter = rng.uniform(-0.09, 0.09, size=values.size)
-        ax.scatter(x_position + jitter, values, s=20, color="#111111",
-                   zorder=3, alpha=0.85, linewidths=0.3)
 
     # ---- 坐标范围：用“箱线图自身算出来的上下须”作为数据范围，让箱体尽量高 ----
     core_values: List[float] = []
