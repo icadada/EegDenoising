@@ -385,6 +385,13 @@ def build_parser(available_networks: Optional[List[str]] = None, available_metri
     parser.add_typed("--highlight", type=str, default=None,
               help="重点模型名（在对比图/箱线图里用红色突出显示，一般用来标出自己提出的模型）",
               group=group)
+    parser.add_typed("--infer", type=int, default=0, choices=[0, 1],
+              help="训练（含 ANOVA）完成后，是否自动用最后一次实验的权重在测试集上推理并逐样本出图，"
+                   "1=做。结果保存到 results/Inference Result/<噪声标签>/", group=group)
+    parser.add_typed("--infer-max-samples", type=int, default=None,
+              help="推理出图最多画多少个测试样本（默认全部；调试时可设成 5）", group=group)
+    parser.add_typed("--infer-device", type=str, default=None,
+              help="推理使用的设备（默认与训练相同）", group=group)
 
     # ---------------- 训练超参数 ----------------
     group = parser.add_argument_group("训练超参数（默认值按 噪声类型 + 模型 取，见 MODEL_DEFAULT_HYPERPARAMS）")

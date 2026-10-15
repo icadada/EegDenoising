@@ -18,6 +18,11 @@ results/
 │           ├── 训练配置/                        # 训练配置.json、实验摘要.json、各划分整体指标.json
 │           ├── 训练日志.txt                     # 本次实验的完整日志
 │           └── 划分数据/                        # 本次实验划分好的数据集
+├── Inference Result/                          # ★ 测试集逐样本推理图（用最后一次实验的权重）
+│   └── <噪声类型>去噪_<采样率>Hz/               # 例如 EOG去噪_256Hz
+│       ├── 推理配置.json                        # 实验次数、测试集来源、各模型权重与整体指标
+│       ├── 划分数据/                            # 本次推理实际使用的测试集
+│       └── 测试样本_0001/<模型名>.png            # 每个测试样本一张图（Noisy灰/Pure绿/Denoised蓝）
 └── 对比图/                                     # ★ 所有“论文用图”集中在这里（尺寸统一 1080x1080）
     └── <噪声类型>去噪_<采样率>Hz/               # 例如 EMG去噪_512Hz（注意是 Hz）
         ├── <标签>_对比_CC_test.png              # 横轴 SNR(dB)、纵轴 CC；曲线 = K 次均值，阴影 = ±1 标准差（--shade none 可关）
@@ -71,6 +76,14 @@ python code/main.py --resume latest --epochs 80
 
 # ⑥ 对某次实验重新绘图（只画单次实验的诊断图，不动对比图）
 python code/main.py --plot-only Simple_CNN/EMG去噪_512HZ
+
+# ⑦ 测试集逐样本推理图（最后一次实验的权重；Noisy灰 / Pure绿 / Denoised蓝）
+python code/inference.py --noise-type EOG
+python code/inference.py --noise-type EMG --max-samples 20 --models fcNN Novel_CNN
+
+# ⑧ 训练时顺带做推理：训练 → ANOVA → 推理 一条命令
+python code/main.py --models fcNN Simple_CNN Complex_CNN RNN_lstm Novel_CNN \
+  --noise-type EOG --repeat-k 10 --device cuda:0 --infer 1
 ```
 
 详细说明见项目根目录的 `说明文档.md`。

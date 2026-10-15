@@ -817,6 +817,25 @@ def run_experiment_campaign(config: Any, parser: Any, device: str) -> int:
     elif len(models) == 1:
         print("[提示] 只训练了一个模型，跳过方差分析（ANOVA 需要 >= 2 个模型）")
 
+    # ---------- 推理：用最后一次实验的权重在测试集上逐样本出图 ----------
+    if int(getattr(config, "infer", 0)) == 1:
+        try:
+            from inference import run_inference
+
+            run_inference(
+                result_dir=config.result_dir,
+                noise_type=noise_type,
+                models=models,
+                trial=None,  # None = 取各模型里最大的实验次数（最后一次）
+                max_samples=getattr(config, "infer_max_samples", None),
+                device=getattr(config, "infer_device", None) or device,
+            )
+        except Exception as error:
+            print(f"[警告] 推理出图失败（训练结果不受影响）：{error}", flush=True)
+    else:
+        print("[提示] 需要生成测试集推理图时，加 --infer 1，或单独运行 "
+              "python code/inference.py --noise-type <EMG|EOG>")
+
     print("全部完成。")
     return 0
 
