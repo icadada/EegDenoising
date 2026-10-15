@@ -23,6 +23,7 @@ results/
 │       ├── 推理配置.json                        # 实验次数、测试集来源、各模型权重与整体指标
 │       ├── 划分数据/                            # 本次推理实际使用的测试集
 │       └── 测试样本_0001/<模型名>.png            # 每个测试样本一张图（Noisy灰/Pure绿/Denoised蓝）
+│                                                # 默认取 worst SNR(-7dB)；--snr all 时文件名带 _SNR-7dB
 └── 对比图/                                     # ★ 所有“论文用图”集中在这里（尺寸统一 1080x1080）
     └── <噪声类型>去噪_<采样率>Hz/               # 例如 EMG去噪_512Hz（注意是 Hz）
         ├── <标签>_对比_CC_test.png              # 横轴 SNR(dB)、纵轴 CC；曲线 = K 次均值，阴影 = ±1 标准差（--shade none 可关）
@@ -80,6 +81,7 @@ python code/main.py --plot-only Simple_CNN/EMG去噪_512HZ
 # ⑦ 测试集逐样本推理图（最后一次实验的权重；Noisy灰 / Pure绿 / Denoised蓝）
 python code/inference.py --noise-type EOG
 python code/inference.py --noise-type EMG --max-samples 20 --models fcNN Novel_CNN
+python code/inference.py --noise-type EMG --snr -4 0        # 指定 SNR 档位（默认 worst=-7dB）
 
 # ⑧ 训练时顺带做推理：训练 → ANOVA → 推理 一条命令
 python code/main.py --models fcNN Simple_CNN Complex_CNN RNN_lstm Novel_CNN \

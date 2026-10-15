@@ -828,6 +828,7 @@ def run_experiment_campaign(config: Any, parser: Any, device: str) -> int:
                 models=models,
                 trial=None,  # None = 取各模型里最大的实验次数（最后一次）
                 max_samples=getattr(config, "infer_max_samples", None),
+                snr_selection=getattr(config, "infer_snr", None),
                 device=getattr(config, "infer_device", None) or device,
             )
         except Exception as error:

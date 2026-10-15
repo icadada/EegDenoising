@@ -82,6 +82,75 @@ DPI = 150
 
 
 # --------------------------------------------------------------------------------------
+# SNR 档位选择
+# --------------------------------------------------------------------------------------
+
+#: ``--snr`` 支持的关键字
+SNR_KEYWORDS: Dict[str, str] = {
+    "worst": "最低 SNR（噪声最强，去噪收益最明显）",
+    "best": "最高 SNR（噪声最弱）",
+    "mid": "中间档位",
+    "all": "全部档位",
+}
+
+
+def resolve_snr_levels(selection: Optional[Sequence[str]], levels: np.ndarray
+                       ) -> Tuple[List[float], bool]:
+    """把 ``--snr`` 的取值解析成具体档位列表。
+
+    支持 ``worst`` / ``best`` / ``mid`` / ``all`` 以及显式数值（如 ``-4`` ``0`` ``1.5``）。
+
+    :return: ``(档位值列表, 是否为默认的单档模式)``
+    """
+    available = [float(v) for v in np.asarray(levels, dtype=np.float64)]
+    if not available:
+        return [], True
+    if not selection:  # 默认：最难的那一档
+        return [min(available)], True
+
+    chosen: List[float] = []
+    for raw in selection:
+        text = str(raw).strip().lower()
+        if text in SNR_KEYWORDS:
+            if text == "worst":
+                wanted = [min(available)]
+            elif text == "best":
+                wanted = [max(available)]
+            elif text == "mid":
+                middle = available[len(available) // 2]
+                wanted = [middle]
+            else:  # all
+                wanted = list(available)
+        else:
+            try:
+                value = float(text)
+            except ValueError as error:
+                raise ValueError(
+                    f"--snr 只能是 {list(SNR_KEYWORDS)} 或具体数值（dB），收到：{raw}"
+                ) from error
+            # 允许写 -4 而档位是 -4.0；容差取档位间距的一小部分
+            step = (max(available) - min(available)) / max(len(available) - 1, 1)
+            nearest = min(available, key=lambda item: abs(item - value))
+            if abs(nearest - value) > max(step * 0.25, 1e-6):
+                raise ValueError(
+                    f"--snr {raw} 不在测试集的 SNR 档位里，可选：{available}"
+                )
+            wanted = [nearest]
+        for value in wanted:
+            if value not in chosen:
+                chosen.append(value)
+    return chosen, len(chosen) == 1 and len(selection) == 0
+
+
+def snr_file_suffix(snr_value: float, multi: bool) -> str:
+    """多个 SNR 档位同时出图时，把档位写进文件名以免互相覆盖。"""
+    if not multi:
+        return ""
+    text = f"{snr_value:+.0f}" if float(snr_value).is_integer() else f"{snr_value:+.1f}"
+    return f"_SNR{text}dB"
+
+
+# --------------------------------------------------------------------------------------
 # 发现「第 K 次实验」的权重
 # --------------------------------------------------------------------------------------
 
@@ -332,6 +401,8 @@ def run_inference(
     models: Optional[Sequence[str]] = None,
     trial: Optional[int] = None,
     max_samples: Optional[int] = None,
+    snr_selection: Optional[Sequence[str]] = None,
+    annotate: bool = True,
     sample_index_offset: int = 1,
     device: str = "auto",
     batch_size: int = 128,
@@ -382,7 +453,18 @@ def run_inference(
 
     # 每个模型在自己的 SNR 档位上做一次推理，得到逐样本波形
     # 测试集排布：外层 SNR 档位、内层样本，因此第 i 个样本分布在 snr == level 的每个块里
+    # 测试集排布是“外层 SNR 档位、内层样本”，因此每个档位的行区间是连续的；
+    # np.unique 会返回升序，正好对应块 0..N-1（下面还会做一次一致性断言）
     levels = np.unique(snr) if snr.size else np.array([np.nan])
+    try:
+        snr_levels, default_single = resolve_snr_levels(snr_selection, levels)
+    except ValueError as error:
+        raise ValueError(str(error)) from error
+    multi_snr = len(snr_levels) > 1
+    logger(f"使用的 SNR 档位：{snr_levels} dB（测试集共 {len(levels)} 档 "
+           f"{float(np.min(levels)):.0f}~{float(np.max(levels)):.0f} dB；"
+           f"{'默认取最难的一档' if default_single else '按 --snr 指定'}）；"
+           f"输出文件名{'带' if multi_snr else '不带'} SNR 后缀")
     sample_positions = np.arange(num_samples)
 
     summary: Dict[str, Any] = {
@@ -390,7 +472,8 @@ def run_inference(
         "实验次数": int(trial),
         "测试集来源": split_source,
         "测试集样本数": int(num_samples),
-        "SNR档位": [float(v) for v in levels],
+        "测试集全部SNR档位": [float(v) for v in levels],
+        "本次使用的SNR档位": [float(v) for v in snr_levels],
         "设备": device,
         "输出目录": out_root,
         "模型": {},
@@ -406,6 +489,16 @@ def run_inference(
         logger(f"[{model_name}] 已加载权重（第 {content.get('epoch', '?')} 轮，"
                f"挑选准则 {content.get('挑选划分', '?')}_{content.get('挑选指标', '?')}）")
 
+        # 一致性断言：确保“块号 x 每档样本数”真的落在该 SNR 档位的行区间内
+        for block, value in enumerate(levels):
+            probe = block * per_level
+            if probe < snr.size and abs(float(snr[probe]) - float(value)) > 1e-6:
+                raise RuntimeError(
+                    "测试集的 SNR 分块与预期不一致（块 "
+                    f"{block} 首个样本的 SNR = {float(snr[probe])}，期望 {float(value)}）；"
+                    "请检查 划分数据/ 是否与本次实验匹配"
+                )
+
         denoised = denoise_all(model, noisy, device, batch_size)
         metrics: Dict[str, float] = {}
         for metric in ("MSE", "SNR", "CC", "RRMSE"):
@@ -415,20 +508,28 @@ def run_inference(
             except Exception as error:  # 指标算不出来不影响出图
                 logger(f"[{model_name}] 指标 {metric} 计算失败：{error}")
 
-        # 逐样本出图：样本 i 对应每个 SNR 档位块里的第 i 个位置
+        # 逐样本出图：样本 i 在每个 SNR 档位块里都位于第 i 个位置
+        block_of: Dict[float, int] = {float(value): block for block, value in enumerate(levels)}
+        written = 0
         for index in sample_positions:
-            rows = [block * per_level + index
-                    for block in range(num_levels)
-                    if block * per_level + index < noisy.shape[0]]
-            if not rows:
-                continue
             folder = ensure_dir(os.path.join(
                 out_root, f"测试样本_{index + sample_index_offset:04d}"))
-            path = os.path.join(folder, f"{model_name}.png")
-            plot_sample(
-                noisy[rows[0]], clean[rows[0]], denoised[rows[0]], path,
-                snr_db=float(snr[rows[0]]) if snr.size else None,
-            )
+            for snr_value in snr_levels:
+                block = block_of.get(float(snr_value))
+                if block is None:
+                    continue
+                row = block * per_level + index
+                if row >= noisy.shape[0]:
+                    continue
+                path = os.path.join(
+                    folder,
+                    f"{model_name}{snr_file_suffix(snr_value, multi_snr)}.png",
+                )
+                plot_sample(
+                    noisy[row], clean[row], denoised[row], path,
+                    snr_db=snr_value if annotate and snr.size else None,
+                )
+                written += 1
 
         summary["模型"][model_name] = {
             "权重": os.path.relpath(layout.weights_path, result_dir),
@@ -437,9 +538,10 @@ def run_inference(
             "挑选指标": content.get("挑选指标"),
             "随机种子": content.get("随机种子"),
             "整体指标(全部测试样本)": metrics,
-            "图片数量": int(len(sample_positions)),
+            "图片数量": int(written),
         }
-        logger(f"[{model_name}] 已生成 {len(sample_positions)} 张图；"
+        logger(f"[{model_name}] 已生成 {written} 张图"
+               f"（{len(sample_positions)} 个样本 x {len(snr_levels)} 个 SNR 档位）；"
                f"整体指标 " + "，".join(f"{k}={v:.6g}" for k, v in metrics.items()))
 
     save_json(os.path.join(out_root, "推理配置.json"), summary)
@@ -462,6 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="用第几次实验的权重（默认取各模型里最大的，即最后一次）")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="最多画多少个测试样本（默认全部；调试时可用 --max-samples 5）")
+    parser.add_argument("--snr", nargs="+", default=None, metavar="SNR",
+                        help="用测试集的哪个 SNR 档位：worst(默认，最难) / best / mid / all，"
+                             "或具体数值（如 -7 -4 0）；多档时文件名会带 _SNR-7dB 后缀")
+    parser.add_argument("--no-annotate", action="store_true",
+                        help="不在图上写输入 SNR（默认会写一行小标题）")
     parser.add_argument("--sample-index-offset", type=int, default=1,
                         help="样本文件夹编号起始值，默认 1（即 测试样本_0001）")
     parser.add_argument("--device", default="auto", help="auto / cpu / cuda:0")
@@ -482,7 +589,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not models:
             print(f"[错误] {result_dir} 下没有找到 {noise_type} 的训练结果", file=sys.stderr)
             return 2
-        print(f"{noise_type} 可用模型与实验次数：")
+        from data_prepare import SNR_LEVELS
+
+        print(f"{noise_type} 可用模型与实验次数（测试集 SNR 档位："
+              f"{np.round(SNR_LEVELS, 1).tolist()} dB）：")
         for model in models:
             trials = list_trials(result_dir, model, noise_type)
             layout = ResultLayout(result_dir, model, noise_type, max(trials))
@@ -498,6 +608,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             models=args.models,
             trial=args.trial,
             max_samples=args.max_samples,
+            snr_selection=args.snr,
+            annotate=not args.no_annotate,
             sample_index_offset=max(1, int(args.sample_index_offset)),
             device=args.device,
             batch_size=int(args.batch_size),
