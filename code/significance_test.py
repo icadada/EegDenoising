@@ -36,11 +36,14 @@
 
     python code/significance_test.py --noise-type EOG --split test
 
-产出（默认写在 ``results/<模型>/<噪声>去噪_<采样率>HZ/统计分析/`` 下）::
+产出：
 
-    <噪声类型>_显著性检验.json      ANOVA + Tukey HSD 的完整结果
-    <噪声类型>_显著性检验.csv       同样内容整理成表格，便于写论文
-    <噪声类型>_显著性检验_<指标>_箱线图.png   带显著性标注的箱线图
+- 箱线图统一放在 ``results/对比图/<噪声>去噪_<采样率>Hz/`` 下，
+  文件名形如 ``EMG去噪_512Hz_显著性检验_SNR_箱线图.png``；
+- 箱线图的统计量（n / 中位数 / 均值 / 标准差 / IQR）不再画在图上，
+  而是输出成 ``EMG去噪_512Hz_显著性检验_统计表.csv``（同一目录下），方便直接做成论文表格；
+- ANOVA + Tukey HSD 的完整结果仍写在 ``<模型>/<噪声>去噪_<采样率>HZ/统计分析/`` 下：
+  ``<噪声类型>_显著性检验.json`` / ``.csv`` / ``_摘要.json``。
 """
 from __future__ import annotations
 
@@ -70,10 +73,14 @@ from utils import (  # noqa: E402
 ALPHA = 0.05
 STAR_LEVELS: Tuple[Tuple[float, str], ...] = ((0.001, "***"), (0.01, "**"), (0.05, "*"))
 
-#: 指标的英文显示名（写进图与表格，避免中文字体依赖）
+#: 箱线图输出尺寸/dpi：与 compare_results.py 完全一致，保证论文里所有图同尺寸
+FIG_SIZE: Tuple[float, float] = (5.4, 5.4)
+BOXPLOT_DPI = 200
+
+#: 指标的显示名（纵轴只写指标缩写，避免中文字体依赖）
 METRIC_DISPLAY_EN: Dict[str, str] = {
     "MSE": "MSE",
-    "SNR": "SNR (dB)",
+    "SNR": "SNR(dB)",
     "CC": "CC",
     "RRMSE": "RRMSE",
 }
@@ -460,6 +467,116 @@ def _bracket_levels(
     return placed
 
 
+def boxplot_statistics(labels: Sequence[str], data: Sequence[np.ndarray],
+                       metric: str, split: str) -> List[Dict[str, Any]]:
+    """计算箱线图的统计量（n / 中位数 / 均值 / 标准差 / Q1 / Q3 / IQR / 极值）。"""
+    rows: List[Dict[str, Any]] = []
+    for model, values in zip(labels, data):
+        values = np.asarray(values, dtype=np.float64)
+        q1, q3 = np.percentile(values, [25, 75])
+        rows.append(
+            {
+                "指标": metric,
+                "数据划分": split,
+                "模型": model,
+                "n": int(values.size),
+                "中位数": float(np.median(values)),
+                "均值": float(np.mean(values)),
+                "标准差": float(np.std(values, ddof=1)) if values.size > 1 else 0.0,
+                "Q1": float(q1),
+                "Q3": float(q3),
+                "四分位距IQR": float(q3 - q1),
+                "最小值": float(np.min(values)),
+                "最大值": float(np.max(values)),
+            }
+        )
+    return rows
+
+
+def save_reading_note(analysis: Dict[str, Any], tag: str, path: str,
+                      stats_rows: Sequence[Dict[str, Any]]) -> str:
+    """写一份“怎么看这些图”的说明文件（图上 ``*`` 的含义 + ANOVA/Tukey 结论 + 统计量）。"""
+    ensure_dir(os.path.dirname(os.path.abspath(path)))
+    split_label = {"train": "训练集", "val": "验证集", "test": "测试集"}.get(
+        str(analysis.get("数据划分")), str(analysis.get("数据划分")))
+    lines = [
+        f"# {tag} 显著性检验说明",
+        "",
+        f"- 生成时间：{analysis.get('生成时间')}",
+        f"- 噪声类型：{analysis.get('噪声类型')}",
+        f"- 数据划分：{split_label}（用 K 次独立重复实验在该划分上的 **K 个原始值**做检验）",
+        "- 因子（自变量）：模型；因变量：某个评价指标",
+        f"- 检验方法：{analysis.get('检验方法')}",
+        f"- 显著性水平：{analysis.get('显著性水平')}",
+        "",
+        "## 图上的标记怎么读",
+        "",
+        "| 标记 | 含义 |",
+        "|---|---|",
+        "| `*` | p < 0.05（差异显著） |",
+        "| `**` | p < 0.01（差异很显著） |",
+        "| `***` | p < 0.001（差异极显著） |",
+        "| 无横线 | 该模型对之间差异不显著（p ≥ 0.05） |",
+        "",
+        "横线两端连接的即被比较的两个模型；箱体 = 四分位距 IQR，红线 = 中位数，",
+        "须 = 非异常值范围，散点 = K 次实验的原始数值。",
+        "图上不写标题、不标注 ANOVA 的 F/p，正文里按下表引用即可。",
+        "",
+        "## 方差分析结果",
+        "",
+        "| 指标 | F | p | 是否显著 | 显著模型对（Tukey HSD） |",
+        "|---|---|---|---|---|",
+    ]
+    for metric, record in analysis.get("各指标", {}).items():
+        anova = record.get("ANOVA") or {}
+        pairs = [pair for pair in ((record.get("TukeyHSD") or {}).get("两两比较") or [])
+                 if pair.get("显著(p<0.05)")]
+        pair_text = "；".join(
+            f"{pair['模型A']} vs {pair['模型B']} ({pair['星号']}, p={pair['p值']:.3g})"
+            for pair in pairs
+        ) or ("—" if anova.get("显著(p<0.05)") else "不显著，按常规不做事后检验")
+        f_stat, p_value = anova.get("F统计量"), anova.get("p值")
+        if isinstance(f_stat, (int, float)) and isinstance(p_value, (int, float)):
+            lines.append(f"| {metric} | {f_stat:.3f} | {p_value:.3g} | "
+                         f"{'是' if anova.get('显著(p<0.05)') else '否'} | {pair_text} |")
+        else:
+            lines.append(f"| {metric} | — | — | {record.get('说明', '不可检验')} | — |")
+    lines += [
+        "",
+        "## 各模型统计量（由 K 次独立实验计算）",
+        "",
+        "| 指标 | 模型 | n | 中位数 | 均值 | 标准差 | Q1 | Q3 | IQR |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for row in stats_rows:
+        lines.append(
+            f"| {row['指标']} | {row['模型']} | {row['n']} | {row['中位数']:.4g} | "
+            f"{row['均值']:.4g} | {row['标准差']:.4g} | {row['Q1']:.4g} | {row['Q3']:.4g} | "
+            f"{row['四分位距IQR']:.4g} |"
+        )
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return path
+
+
+def save_statistics_csv(rows: Sequence[Dict[str, Any]], path: str) -> str:
+    """把箱线图统计量写成 CSV（UTF-8-BOM，Excel 可直接打开）。"""
+    ensure_dir(os.path.dirname(os.path.abspath(path)))
+    header = ["指标", "数据划分", "模型", "n", "中位数", "均值", "标准差",
+              "Q1", "Q3", "四分位距IQR", "最小值", "最大值"]
+    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for row in rows:
+            writer.writerow([
+                row["指标"], row["数据划分"], row["模型"], row["n"],
+                f"{row['中位数']:.10g}", f"{row['均值']:.10g}", f"{row['标准差']:.10g}",
+                f"{row['Q1']:.10g}", f"{row['Q3']:.10g}", f"{row['四分位距IQR']:.10g}",
+                f"{row['最小值']:.10g}", f"{row['最大值']:.10g}",
+            ])
+    return path
+
+
 def plot_boxplot_with_significance(
     analysis: Dict[str, Any],
     metric: str,
@@ -469,8 +586,14 @@ def plot_boxplot_with_significance(
     split: str = "test",
     output_dir: Optional[str] = None,
     lang: str = "en",
+    tag: Optional[str] = None,
+    highlight: Optional[str] = None,
 ) -> Optional[str]:
-    """画某个指标的箱线图，并按 Tukey HSD 结果在箱子上方标注显著性。"""
+    """画某个指标的箱线图（方形、无标题），并按 Tukey HSD 结果标注显著性。
+
+    图上只保留坐标轴、箱体/散点与 ``*``/``**``/``***`` 横线；
+    具体统计量（n/中位数/均值/标准差/IQR）由 :func:`save_statistics_csv` 输出成 CSV。
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -479,46 +602,64 @@ def plot_boxplot_with_significance(
     from plotting import configure_fonts
 
     lang = configure_fonts(lang)
+    tag = tag or noise_label(noise_type).replace("HZ", "Hz")
 
     model_values = collect_trial_values(result_dir, noise_type, models, metric, split)
-    labels = [model for model in models if model_values.get(model) is not None and model_values[model].size]
+    labels = [model for model in models
+              if model_values.get(model) is not None and model_values[model].size]
     if not labels:
         return None
 
     data = [model_values[model] for model in labels]
     positions = np.arange(1, len(labels) + 1, dtype=np.float64)
-    fig, ax = plt.subplots(figsize=(max(7.2, 1.9 * len(labels)), 5.6))
+    # 统一方形画布（与 compare_results.py 一致，5.4x5.4 英寸 @200dpi = 1080x1080）
+    span = max(1.0, float(len(labels)) + 0.2)          # 横轴跨度
+    unit = FIG_SIZE[0] / 5.6                            # 每个单位宽度占多少英寸
+    fig, ax = plt.subplots(figsize=(max(FIG_SIZE[0], span * unit), FIG_SIZE[1]))
     box = ax.boxplot(
         data,
         positions=positions,
-        widths=0.55,
+        widths=0.62,
         patch_artist=True,
         showmeans=False,
         tick_labels=labels,
-        medianprops={"color": "#D62728", "linewidth": 2.0},
-        boxprops={"linewidth": 1.2, "edgecolor": "#333333"},
-        whiskerprops={"linewidth": 1.1},
-        capprops={"linewidth": 1.1},
+        medianprops={"color": "#FF7F0E", "linewidth": 2.0},   # 参考图：橙色中位线
+        boxprops={"linewidth": 1.1, "edgecolor": "#222222"},
+        whiskerprops={"linewidth": 1.0, "linestyle": "-"},
+        capprops={"linewidth": 1.0},
         flierprops={"marker": "o", "markersize": 4, "markerfacecolor": "#888888",
-                    "markeredgecolor": "#555555", "alpha": 0.8},
+                    "markeredgecolor": "#555555", "alpha": 0.85},
     )
     for index, patch in enumerate(box["boxes"]):
-        patch.set_facecolor(COLOR_CYCLE[index % len(COLOR_CYCLE)])
-        patch.set_alpha(0.55)
+        if highlight and labels[index] == highlight:
+            patch.set_facecolor("#d62728")
+            patch.set_alpha(0.85)
+        else:
+            patch.set_facecolor(COLOR_CYCLE[index % len(COLOR_CYCLE)])
+            patch.set_alpha(0.75)
 
-    # 叠加 K 次实验的原始散点（抖动显示），信息量比“均值±方差”更大
+    # 叠加 K 次实验的原始散点（轻微抖动），比“均值±方差”信息更多
     rng = np.random.default_rng(20240101)
     for x_position, values in zip(positions, data):
-        jitter = rng.uniform(-0.10, 0.10, size=values.size)
-        ax.scatter(x_position + jitter, values, s=22, color="#222222",
-                   zorder=3, alpha=0.75, linewidths=0.4)
+        jitter = rng.uniform(-0.09, 0.09, size=values.size)
+        ax.scatter(x_position + jitter, values, s=20, color="#111111",
+                   zorder=3, alpha=0.85, linewidths=0.3)
 
-    # 坐标范围：以“数据本身的跨度”为基准，顶部按显著性横线数量留白
-    core_values = np.concatenate([np.array([group.min(), group.max()]) for group in data])
-    lower, upper = float(np.min(core_values)), float(np.max(core_values))
-    pad = max((upper - lower) * 0.10, abs(upper) * 0.02, 1e-9)
+    # ---- 坐标范围：用“箱线图自身算出来的上下须”作为数据范围，让箱体尽量高 ----
+    core_values: List[float] = []
+    for values in data:
+        q1, q3 = np.percentile(values, [25, 75])
+        iqr = q3 - q1
+        low = float(np.min(values[values >= q1 - 1.5 * iqr])) if np.any(values >= q1 - 1.5 * iqr) \
+            else float(np.min(values))
+        high = float(np.max(values[values <= q3 + 1.5 * iqr])) if np.any(values <= q3 + 1.5 * iqr) \
+            else float(np.max(values))
+        core_values += [low, high, float(np.min(values)), float(np.max(values))]
+    lower, upper = min(core_values), max(core_values)
+    pad = max((upper - lower) * 0.06, abs(upper) * 0.015, 1e-9)
     span = max(upper - lower, abs(upper) * 0.05, 1e-12)
 
+    # ---- 显著性横线：按 Tukey HSD 结果逐对标注 ----
     tukey = (analysis["各指标"].get(metric, {}) or {}).get("TukeyHSD") or {}
     significant_pairs = [pair for pair in (tukey.get("两两比较") or []) if pair.get("显著(p<0.05)")]
     x_positions = {model: float(position) for model, position in zip(labels, positions)}
@@ -527,49 +668,32 @@ def plot_boxplot_with_significance(
     highest = upper
     for bracket in brackets:
         x1, x2, y, h = bracket["x1"], bracket["x2"], bracket["y"], bracket["h"]
-        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], linewidth=1.2, color="#333333")
+        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], linewidth=1.25, color="#222222")
         ax.text((x1 + x2) / 2.0, y + h, bracket["星号"], ha="center", va="bottom",
-                fontsize=14, fontweight="bold", color="#B22222")
+                fontsize=15, fontweight="bold", color="#B22222")
         highest = max(highest, y + h)
 
-    ax.set_ylim(lower - pad * 1.6, highest + pad * 0.9)
-    ax.set_xlim(0.4, len(labels) + 0.6)
-    ax.set_ylabel(f"{METRIC_DISPLAY_EN.get(metric, metric)} on {split} set")
-    anova = (analysis["各指标"].get(metric, {}) or {}).get("ANOVA") or {}
-    p_value = anova.get("p值")
-    p_text = (
-        f"F = {anova.get('F统计量'):.2f}, p = {p_value:.3g} "
-        f"({'significant' if p_value < analysis.get('显著性水平', ALPHA) else 'not significant'})"
-        if isinstance(p_value, (int, float)) and np.isfinite(p_value) else "not available"
-    )
-    title = (
-        f"{metric} on {split} set | {len(labels)} models x K = {max(len(v) for v in data)} "
-        f"independent runs ({noise_type} denoising)\n"
-        f"One-way ANOVA: {p_text}\n"
-        f"* p<0.05,  ** p<0.01,  *** p<0.001   (Tukey HSD)"
-    )
-    ax.set_title(title, fontsize=9.5)
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_ylim(lower - pad * 1.1, highest + pad * 1.15)
+    ax.set_xlim(0.45, len(labels) + 0.55)
+    ax.set_ylabel(METRIC_DISPLAY_EN.get(metric, metric), fontsize=11)
+    ax.grid(True, color="#d9d9d9", linewidth=0.7, alpha=0.9)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.9)
+        spine.set_color("#333333")
+    ax.tick_params(direction="in", length=4, width=0.9)
+    label_size = 10.0 if len(labels) <= 4 else max(7.0, 42.0 / max(len(name) for name in labels))
+    ax.set_xticklabels(labels, fontsize=label_size, rotation=12, ha="right")
+    ax.tick_params(axis="y", labelsize=10)
 
-    # 把每个模型的中位数/均值/标准差/IQR 以表格形式放在图下方（不遮挡箱体与显著性横线）
-    header = f"{'model':<14}{'n':>3}{'median':>12}{'mean':>12}{'std':>11}{'IQR':>11}"
-    rows = [header, "-" * len(header)]
-    for model, values in zip(labels, data):
-        q1, q3 = np.percentile(values, [25, 75])
-        rows.append(
-            f"{model:<14}{values.size:>3}{np.median(values):>12.4f}{np.mean(values):>12.4f}"
-            f"{(np.std(values, ddof=1) if values.size > 1 else 0.0):>11.4f}{(q3 - q1):>11.4f}"
-        )
-    box_style = {"boxstyle": "round,pad=0.45", "facecolor": "#F7F7F7", "edgecolor": "#BBBBBB"}
-    ax.text(0.5, -0.11 - 0.035 * len(labels), "\n".join(rows), transform=ax.transAxes,
-            ha="center", va="top", fontsize=8, family="monospace", bbox=box_style)
-
-    fig.subplots_adjust(left=0.09, right=0.98, top=0.82,
-                        bottom=0.30 + 0.038 * len(labels))
+    # 图上不写标题、不写 ANOVA 结论、不画统计表、不加图例
+    # （* / ** / *** 的含义写在 <标签>_显著性检验说明.md 里）
 
     output_dir = ensure_dir(output_dir or os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(output_dir, f"{noise_type}_显著性检验_{metric}_箱线图.png")
-    fig.savefig(path, dpi=200)
+    path = os.path.join(output_dir, f"{tag}_显著性检验_{metric}_箱线图.png")
+    fig.set_size_inches(*FIG_SIZE)
+    fig.subplots_adjust(left=0.13, right=0.975, top=0.975, bottom=0.115)
+    fig.savefig(path, dpi=BOXPLOT_DPI)
     plt.close(fig)
     return path
 
@@ -589,17 +713,21 @@ def run_significance_analysis(
     stats_dir: Optional[str] = None,
     plots_dir: Optional[str] = None,
     output_prefix: Optional[str] = None,
+    highlight: Optional[str] = None,
 ) -> List[str]:
-    """完整执行“ANOVA + Tukey HSD + 箱线图”，返回全部产物路径。
+    """完整执行“ANOVA + Tukey HSD + 箱线图 + 统计表”，返回全部产物路径。
 
-    默认产物放在 ``<结果根>/<模型>/<噪声>去噪_<采样率>HZ/统计分析/`` 与 ``.../图像/`` 下，
-    文件名为 ``<噪声类型>_显著性检验.json / .csv / _<指标>_箱线图.png``。
+    - 箱线图、统计表 CSV、ANOVA/Tukey 结果统一放在
+      ``results/对比图/<噪声>去噪_<采样率>Hz/`` 下（ANOVA/Tukey 的 JSON/CSV/摘要放
+      ``统计结果/`` 子目录），与 ``compare_results.py`` 的对比图同目录、同尺寸；
+    - 每张箱线图都不带标题，只保留坐标轴与显著性横线。
     """
     from utils import timestamp
 
     result_dir = resolve_result_root(result_dir)
     noise_type = str(noise_type).upper()
     label = noise_label(noise_type)
+    tag = noise_label(noise_type).replace("HZ", "Hz")
 
     # 用“第一个找到的模型目录”定位噪声目录
     if models:
@@ -626,20 +754,35 @@ def run_significance_analysis(
 
     analysis = analyze(result_dir, noise_type, model_list, metric_list, split, alpha)
     prefix = output_prefix or noise_type
-    stats_dir = ensure_dir(stats_dir or os.path.join(noise_dir, "统计分析"))
-    plots_dir = ensure_dir(plots_dir or os.path.join(noise_dir, "图像"))
+    # 图像与统计结果统一放在 results/对比图/<噪声>去噪_<采样率>Hz/ 下
+    comparison_root = os.path.join(result_dir, "对比图", tag)
+    plots_dir = ensure_dir(plots_dir or comparison_root)
+    stats_dir = ensure_dir(stats_dir or os.path.join(comparison_root, "统计结果"))
 
     artifacts = [
         save_analysis_json(analysis, os.path.join(stats_dir, f"{prefix}_显著性检验.json")),
         save_analysis_csv(analysis, os.path.join(stats_dir, f"{prefix}_显著性检验.csv")),
     ]
+
+    # 箱线图 + 统计表 CSV（统计表取代原来画在图下方的表格）
+    stat_rows: List[Dict[str, Any]] = []
     for metric in metric_list:
+        model_values = collect_trial_values(result_dir, noise_type, model_list, metric, split)
+        labels = [m for m in model_list if model_values.get(m) is not None and model_values[m].size]
+        stat_rows += boxplot_statistics(labels, [model_values[m] for m in labels], metric, split)
         path = plot_boxplot_with_significance(
             analysis, metric, result_dir, noise_type, model_list,
-            split=split, output_dir=plots_dir, lang=lang,
+            split=split, output_dir=plots_dir, lang=lang, tag=tag, highlight=highlight,
         )
         if path:
             artifacts.append(path)
+    if stat_rows:
+        artifacts.append(save_statistics_csv(
+            stat_rows, os.path.join(plots_dir, f"{tag}_显著性检验_统计表.csv")
+        ))
+        artifacts.append(save_reading_note(
+            analysis, tag, os.path.join(plots_dir, f"{tag}_显著性检验说明.md"), stat_rows
+        ))
 
     # 把结论摘要也写进汇总里，方便一眼看到“谁和谁有显著差异”
     summary = {
@@ -681,6 +824,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="test", choices=["train", "val", "test"],
                         help="用哪个数据划分的 K 个结果做检验，默认 test（测试集）")
     parser.add_argument("--alpha", type=float, default=ALPHA, help="显著性水平，默认 0.05")
+    parser.add_argument("--highlight", default=None,
+                        help="重点模型名（红色突出显示，一般用来标出自己提出的模型）")
     parser.add_argument("--lang", default="en", choices=["en", "zh"], help="图像语言")
     return parser
 
@@ -701,6 +846,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             split=args.split,
             alpha=float(args.alpha),
             lang=args.lang,
+            highlight=args.highlight,
         )
     except (FileNotFoundError, ValueError) as error:
         print(f"[错误] {error}", file=sys.stderr)

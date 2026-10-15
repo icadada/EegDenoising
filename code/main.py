@@ -542,21 +542,96 @@ def clean_noise_results(result_dir: str, model_name: str, noise_type: str,
         ):
             os.remove(path)
             removed.append(name)
-    # 清理可能由旧版本直接写在模型目录下的汇总/箱线图文件
-    model_root = os.path.dirname(noise_dir)
-    if os.path.isdir(model_root):
-        for name in os.listdir(model_root):
-            path = os.path.join(model_root, name)
-            if not os.path.isfile(path):
-                continue
-            if name.endswith(_SIGNIFICANCE_SUFFIX_JSON) or name.endswith(_SIGNIFICANCE_SUFFIX_CSV):
-                os.remove(path)
-                removed.append(name)
+    # 清理可能由旧版本直接写在模型目录下的汇总/箱线图/日志文件
+    _remove_stray_model_root_files(os.path.dirname(noise_dir), logger, removed=removed)
     if callable(logger):
         if removed:
             logger(f"[清空] 已删除 {len(removed)} 项旧结果：{noise_dir}")
         else:
             logger(f"[清空] {noise_dir} 下没有需要删除的旧结果")
+
+
+def _fix_misplaced_log_dir(model_dir: str, model_name: str, noise_type: str) -> None:
+    """修复历史版本写歪的结果目录。
+
+    早期版本误把“模型目录”当成“结果根目录”传给 ``noise_results_dir``，于是生成了::
+
+        results/<模型名>/<模型名>/<噪声>去噪_<采样率>HZ/<模型名>_运行日志.txt
+
+    这里在训练开始前把这种目录整体搬迁到正确位置
+    （``results/<模型名>/``），再删掉空的错误目录。
+    """
+    import shutil
+
+    model_dir = os.path.abspath(model_dir)
+    result_root = os.path.dirname(model_dir)
+    wrong_dir = os.path.join(model_dir, model_name)
+    if not os.path.isdir(wrong_dir):
+        return
+
+    for noise_name in sorted(os.listdir(wrong_dir)):
+        src_dir = os.path.join(wrong_dir, noise_name)
+        if not os.path.isdir(src_dir) or not str(noise_name).startswith(noise_type):
+            continue
+        dst_dir = ensure_dir(noise_results_dir(result_root, model_name, noise_type))
+        for name in sorted(os.listdir(src_dir)):
+            src, dst = os.path.join(src_dir, name), os.path.join(dst_dir, name)
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(src, ignore_errors=True)
+                else:
+                    shutil.move(src, dst)
+            elif os.path.isfile(src):
+                if os.path.isfile(dst):
+                    with open(src, "r", encoding="utf-8", errors="ignore") as src_handle:
+                        text = src_handle.read()
+                    with open(dst, "a", encoding="utf-8") as dst_handle:
+                        dst_handle.write(text)
+                    os.remove(src)
+                else:
+                    shutil.move(src, dst)
+    # 搬空后删掉错误目录（README.md 之外没有内容就整体删除）
+    leftover = [n for n in os.listdir(wrong_dir) if n != "README.md"]
+    if not leftover:
+        shutil.rmtree(wrong_dir, ignore_errors=True)
+    else:
+        # 只可能还剩空的噪声目录：把去掉子目录后空掉的目录一并清理
+        for name in list(leftover):
+            path = os.path.join(wrong_dir, name)
+            if os.path.isdir(path) and not os.listdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        if [n for n in os.listdir(wrong_dir) if n != "README.md"] == []:
+            shutil.rmtree(wrong_dir, ignore_errors=True)
+
+
+def _remove_stray_model_root_files(model_dir: str, logger: Any = None,
+                                   removed: Optional[List[str]] = None) -> None:
+    """删除残留在 ``<结果根>/<模型名>/`` 这一层的旧版文件。
+
+    正常结构下这一层**只应该有** ``<噪声>去噪_<采样率>HZ/`` 文件夹与 ``README.md``；
+    旧版本会把运行日志、汇总 JSON、箱线图写在模型名这一层，这里顺手清掉。
+    """
+    if not os.path.isdir(model_dir):
+        return
+    dropped: List[str] = []
+    for name in sorted(os.listdir(model_dir)):
+        path = os.path.join(model_dir, name)
+        if not os.path.isfile(path) or name == "README.md":
+            continue
+        if (
+            name.endswith("_运行日志.txt")
+            or name.endswith("_统计汇总.json")
+            or name.endswith(_SIGNIFICANCE_SUFFIX_JSON)
+            or name.endswith(_SIGNIFICANCE_SUFFIX_CSV)
+            or name.lower().endswith(".png")
+        ):
+            os.remove(path)
+            dropped.append(name)
+    if dropped:
+        if removed is not None:
+            removed.extend(dropped)
+        if callable(logger):
+            logger(f"[清理] 已删除模型目录下不该存在的旧文件：{dropped}")
 
 
 # --------------------------------------------------------------------------------------
@@ -679,8 +754,15 @@ def run_experiment_campaign(config: Any, parser: Any, device: str) -> int:
 
     for model_name in models:
         model_dir = ensure_dir(os.path.join(config.result_dir, model_name))
-        noise_dir = ensure_dir(noise_results_dir(model_dir, model_name, noise_type))
+        # 注意：noise_results_dir 的第一个参数是**结果根目录**（它内部会再拼模型名），
+        # 传成 model_dir 会拼出 …/<模型>/<模型>/… 的错误结构。
+        noise_dir = ensure_dir(noise_results_dir(config.result_dir, model_name, noise_type))
+        # 修掉历史版本可能已经写歪的日志目录：…/<模型>/<模型>/<噪声目录>/<模型>_运行日志.txt
+        _fix_misplaced_log_dir(model_dir, model_name, noise_type)
+        # 运行日志保存在“噪声目录”内部（<模型名>/<噪声>去噪_<采样率>HZ/），
+        # 保证 <模型名>/ 这一层只有噪声类型文件夹，不再出现别的文件
         bootstrap_logger = Logger(os.path.join(noise_dir, f"{model_name}_运行日志.txt"))
+        _remove_stray_model_root_files(model_dir, bootstrap_logger)
 
         if int(getattr(config, "clean", 1)) == 1:
             clean_noise_results(config.result_dir, model_name, noise_type, bootstrap_logger)
@@ -727,6 +809,7 @@ def run_experiment_campaign(config: Any, parser: Any, device: str) -> int:
                 models=models,
                 metrics=stats_metrics,
                 lang=config.plot_lang,
+                highlight=getattr(config, "highlight", None),
             ):
                 print(f"  - 显著性检验产物：{path}")
         except Exception as error:

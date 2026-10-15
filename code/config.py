@@ -382,6 +382,9 @@ def build_parser(available_networks: Optional[List[str]] = None, available_metri
     parser.add_typed("--run-significance", type=int, default=1, choices=[0, 1],
               help="训练完成后是否自动做单因素方差分析（ANOVA）与 Tukey HSD 事后检验并画箱线图，1=做（默认）",
               group=group)
+    parser.add_typed("--highlight", type=str, default=None,
+              help="重点模型名（在对比图/箱线图里用红色突出显示，一般用来标出自己提出的模型）",
+              group=group)
 
     # ---------------- 训练超参数 ----------------
     group = parser.add_argument_group("训练超参数（默认值按 噪声类型 + 模型 取，见 MODEL_DEFAULT_HYPERPARAMS）")
