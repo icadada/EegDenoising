@@ -384,10 +384,6 @@ def plot_metric_vs_snr(
     ax.set_ylabel(metric_axis_label(metric), fontsize=11)
     style_axes(ax)
     ax.legend(fontsize=8.5, framealpha=0.9, edgecolor="#999999", loc="best")
-    if highlight:
-        ax.text(0.985, 0.02, f"* {highlight}   {band_label(aggregate, shade)}",
-                transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
-                color=HIGHLIGHT_COLOR)
     return save_square(fig, os.path.join(output_dir, f"{tag}_对比_{metric}_{split}.png"))
 
 
@@ -446,9 +442,6 @@ def plot_loss_comparison(
         ax.set_ylabel("Loss", fontsize=11)
         style_axes(ax)
         ax.legend(fontsize=8.5, framealpha=0.9, edgecolor="#999999", loc="best")
-        if highlight:
-            ax.text(0.985, 0.02, "* best of K runs", transform=ax.transAxes,
-                    ha="right", va="bottom", fontsize=8, color=HIGHLIGHT_COLOR)
         artifacts.append(save_square(fig, os.path.join(output_dir, filename)))
     return artifacts
 

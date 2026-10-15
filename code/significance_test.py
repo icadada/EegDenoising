@@ -431,33 +431,62 @@ def _bracket_levels(
     pairs: Sequence[Dict[str, Any]],
     x_positions: Dict[str, float],
     box_highs: Dict[str, float],
-    span: float,
+    lower: float,
+    upper: float,
+    text_height: float,
+    gap: float,
 ) -> List[Dict[str, Any]]:
-    """为每一对显著差异计算横线的位置层级，避免横线与箱体/其他横线重叠。
+    """为每一对显著差异计算横线位置，保证互不重叠、也不压住箱体/星号。
 
-    算法：按“横跨宽度”从小到大处理，每对横线放在
-    ``max(左组上缘, 右组上缘)`` 之上；若与已放好的横线在水平方向重叠，
-    则再往上抬一个层级（``level``），从而形成自下而上的阶梯。
+    算法：按“横跨宽度”从小到大处理每一对；先把横线放在
+    ``max(两端组的上缘)`` 之上，若与**已放好的横线或它们的星号文字**在水平方向有重叠，
+    就继续往上抬，直到找到不冲突的高度。
+
+    :param lower/upper: 数据（含离群点）的上下界，用来换算内部高度
+    :param text_height: 星号文字大约占多少数据高度（由字号换算）
+    :param gap: 横线与箱体、文字之间的最小间距
     """
     ordered = sorted(
         pairs,
         key=lambda pair: abs(x_positions[pair["模型A"]] - x_positions[pair["模型B"]]),
     )
+    line_height = max(text_height * 0.35, gap)  # 横线自身占的高度（含一点余量）
+    span = max(upper - lower, 1e-12)
+    floor = upper + gap * 0.6  # 第一层横线的最低高度：刚在最高箱体上方
+
     placed: List[Dict[str, Any]] = []
+
+    def overlaps(x1: float, x2: float, item: Dict[str, Any]) -> bool:
+        """水平方向是否与已放好的横线/星号重叠。"""
+        return not (x2 < item["x1"] - 1e-9 or x1 > item["x2"] + 1e-9)
+
     for pair in ordered:
         x1 = min(x_positions[pair["模型A"]], x_positions[pair["模型B"]])
         x2 = max(x_positions[pair["模型A"]], x_positions[pair["模型B"]])
         base = max(float(box_highs.get(pair["模型A"], 0.0)),
                    float(box_highs.get(pair["模型B"], 0.0)))
-        level = 0
-        # 与已有横线水平重叠时需要抬高；逐级尝试直到找到不冲突的高度
-        while any(
-            not (x2 < item["x1"] - 1e-9 or x1 > item["x2"] + 1e-9)
-            and abs(item["level"] - level) == 0
-            for item in placed
-        ):
-            level += 1
-        y = base + span * (0.05 + 0.11 * level)
+        y = max(base + gap, floor)
+
+        # 逐次上抬，直到：既不与已放好的横线重叠、也不与它们的星号文字重叠
+        for _ in range(200):
+            if not placed:
+                break
+            conflict = False
+            for item in placed:
+                if not overlaps(x1, x2, item):
+                    continue
+                # ① 与本横线自身（线 + 竖钩）区间冲突
+                if y < item["y"] + item["h"] + gap and item["y"] < y + line_height + gap:
+                    conflict = True
+                    break
+                # ② 与本横线的星号文字区间冲突（中心 ± 半个星号宽度）
+                if y < item["text_top"] + gap and item["text_bottom"] < y + text_height + gap:
+                    conflict = True
+                    break
+            if not conflict:
+                break
+            y += text_height * 0.6
+
         placed.append(
             {
                 "模型A": pair["模型A"],
@@ -466,10 +495,11 @@ def _bracket_levels(
                 "x2": x2,
                 "p值": pair["p值"],
                 "星号": pair["星号"],
-                "level": int(level),
-                "层级": int(level),
-                "y": y,
-                "h": span * 0.022,
+                "level": int(round((y - floor) / max(text_height * 0.6, 1e-12))),
+                "y": float(y),
+                "h": float(max(span * 0.018, gap * 0.5)),
+                "text_bottom": float(y + max(span * 0.018, gap * 0.5)),
+                "text_top": float(y + max(span * 0.018, gap * 0.5) + text_height),
             }
         )
     return placed
@@ -666,16 +696,28 @@ def plot_boxplot_with_significance(
     significant_pairs = [pair for pair in (tukey.get("两两比较") or []) if pair.get("显著(p<0.05)")]
     x_positions = {model: float(position) for model, position in zip(labels, positions)}
     box_highs = {model: float(np.max(values)) for model, values in zip(labels, data)}
-    brackets = _bracket_levels(significant_pairs, x_positions, box_highs, span)
+
+    # 把“字号”换算成“数据坐标高度”，这样留白与行距在任何量纲下都不会撞车
+    star_fontsize = 13.0
+    axes_height_in = FIG_SIZE[1] * 0.86  # 粗略的绘图区高度（英寸）
+    span_for_text = max(span, 1e-12)
+    text_height = span_for_text * (star_fontsize / 72.0) / max(axes_height_in, 1e-6) * 2.0
+    gap = text_height * 0.35
+
+    brackets = _bracket_levels(significant_pairs, x_positions, box_highs,
+                               lower, upper, text_height, gap)
     highest = upper
     for bracket in brackets:
         x1, x2, y, h = bracket["x1"], bracket["x2"], bracket["y"], bracket["h"]
-        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], linewidth=1.25, color="#222222")
+        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], linewidth=1.2, color="#222222")
         ax.text((x1 + x2) / 2.0, y + h, bracket["星号"], ha="center", va="bottom",
-                fontsize=15, fontweight="bold", color="#B22222")
-        highest = max(highest, y + h)
+                fontsize=star_fontsize, fontweight="bold", color="#B22222",
+                clip_on=False)
+        highest = max(highest, bracket["text_top"])
 
-    ax.set_ylim(lower - pad * 1.1, highest + pad * 1.15)
+    # 顶部留白 = 星号文字高度 + 一点余量；保证最后一层 *** 不会贴边/被裁掉
+    top_margin = text_height * 0.8 if brackets else pad
+    ax.set_ylim(lower - pad * 1.1, highest + top_margin)
     ax.set_xlim(0.45, len(labels) + 0.55)
     ax.set_ylabel(METRIC_DISPLAY_EN.get(metric, metric), fontsize=11)
     ax.grid(True, color="#d9d9d9", linewidth=0.7, alpha=0.9)
@@ -694,7 +736,8 @@ def plot_boxplot_with_significance(
     output_dir = ensure_dir(output_dir or os.path.dirname(os.path.abspath(__file__)))
     path = os.path.join(output_dir, f"{tag}_显著性检验_{metric}_箱线图.png")
     fig.set_size_inches(*FIG_SIZE)
-    fig.subplots_adjust(left=0.13, right=0.975, top=0.975, bottom=0.115)
+    # 顶部留出足够空间给星号（不依赖 tight_layout，避免把星号裁掉）
+    fig.subplots_adjust(left=0.13, right=0.975, top=0.94, bottom=0.115)
     fig.savefig(path, dpi=BOXPLOT_DPI)
     plt.close(fig)
     return path
