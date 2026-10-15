@@ -142,12 +142,15 @@ def resolve_snr_levels(selection: Optional[Sequence[str]], levels: np.ndarray
     return chosen, len(chosen) == 1 and len(selection) == 0
 
 
-def snr_file_suffix(snr_value: float, multi: bool) -> str:
-    """多个 SNR 档位同时出图时，把档位写进文件名以免互相覆盖。"""
-    if not multi:
-        return ""
-    text = f"{snr_value:+.0f}" if float(snr_value).is_integer() else f"{snr_value:+.1f}"
-    return f"_SNR{text}dB"
+def snr_dir_name(snr_value: float) -> str:
+    """返回每个 SNR 档位对应的子文件夹名，例如 ``-7dB`` / ``+0dB`` / ``1.5dB``。
+
+    每个样本文件夹下按 ``--snr`` 选中的档位各建一个子文件夹，
+    对应档位的推理图就放在里面。
+    """
+    value = float(snr_value)
+    text = f"{value:+.0f}" if value.is_integer() else f"{value:+.1f}"
+    return f"{text}dB"
 
 
 # --------------------------------------------------------------------------------------
@@ -288,28 +291,40 @@ def prepare_test_split(
     return data, source
 
 
-def clean_previous_images(out_root: str, models: Sequence[str], logger: Any = None) -> int:
-    """删除本次要重新生成的模型图片（避免上次跑了更多样本时留下过期图片）。
+def purge_dir_contents(directory: str) -> int:
+    """删除目录下的全部内容（只用于脚本自己创建的样本/SNR 目录），返回删除的条目数。"""
+    import shutil
 
-    只删 ``测试样本_*`` 目录里这些模型的 ``<模型名>.png``；某个样本目录清空后一并删除。
-    不影响其它模型已生成的图片。
+    if not os.path.isdir(directory):
+        return 0
+    count = 0
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
+        count += 1
+    return count
+
+
+def clean_previous_images(out_root: str, models: Sequence[str], logger: Any = None) -> int:
+    """清理上次推理留下的旧图，避免目录里混入过期结果。
+
+    由于本次运行会重建每个 ``测试样本_*`` 目录下的全部内容（含各 SNR 子文件夹与旧版本
+    直接写在样本目录里的图片），这里把除 ``划分数据`` 之外的样本目录内容整体清掉。
+    推理是幂等的：每个样本 × 每个选中 SNR × 每个模型都会被重新生成。
     """
     removed = 0
     if not os.path.isdir(out_root):
         return removed
-    wanted = {f"{name}.png" for name in models}
     for name in sorted(os.listdir(out_root)):
         folder = os.path.join(out_root, name)
         if not name.startswith("测试样本_") or not os.path.isdir(folder):
             continue
-        for filename in sorted(os.listdir(folder)):
-            if filename in wanted:
-                os.remove(os.path.join(folder, filename))
-                removed += 1
-        if not os.listdir(folder):
-            os.rmdir(folder)
+        removed += purge_dir_contents(folder)
     if removed and callable(logger):
-        logger(f"已清理上次推理留下的 {removed} 张旧图（模型：{sorted(models)}）")
+        logger(f"已清理上次推理留下的 {removed} 项旧内容（模型：{sorted(models)}）")
     return removed
 
 
@@ -460,11 +475,11 @@ def run_inference(
         snr_levels, default_single = resolve_snr_levels(snr_selection, levels)
     except ValueError as error:
         raise ValueError(str(error)) from error
-    multi_snr = len(snr_levels) > 1
     logger(f"使用的 SNR 档位：{snr_levels} dB（测试集共 {len(levels)} 档 "
            f"{float(np.min(levels)):.0f}~{float(np.max(levels)):.0f} dB；"
            f"{'默认取最难的一档' if default_single else '按 --snr 指定'}）；"
-           f"输出文件名{'带' if multi_snr else '不带'} SNR 后缀")
+           f"每个样本下按 SNR 建 {len(snr_levels)} 个子文件夹："
+           + "、".join(snr_dir_name(v) for v in snr_levels))
     sample_positions = np.arange(num_samples)
 
     summary: Dict[str, Any] = {
@@ -521,10 +536,7 @@ def run_inference(
                 row = block * per_level + index
                 if row >= noisy.shape[0]:
                     continue
-                path = os.path.join(
-                    folder,
-                    f"{model_name}{snr_file_suffix(snr_value, multi_snr)}.png",
-                )
+                path = os.path.join(folder, snr_dir_name(snr_value), f"{model_name}.png")
                 plot_sample(
                     noisy[row], clean[row], denoised[row], path,
                     snr_db=snr_value if annotate and snr.size else None,
@@ -539,6 +551,7 @@ def run_inference(
             "随机种子": content.get("随机种子"),
             "整体指标(全部测试样本)": metrics,
             "图片数量": int(written),
+            "图片目录结构": "测试样本_XXXX/<SNR>dB/<模型名>.png",
         }
         logger(f"[{model_name}] 已生成 {written} 张图"
                f"（{len(sample_positions)} 个样本 x {len(snr_levels)} 个 SNR 档位）；"
